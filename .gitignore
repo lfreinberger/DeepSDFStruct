@@ -126,6 +126,7 @@ confidential*
 
 # slurm files
 slurm-*.out
+run_training.slrm
 
 # intermediate model runs
 mlruns

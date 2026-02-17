@@ -202,6 +202,8 @@ class LatticeSDFStruct(_SDFBase):
             queries_transformed[:, i_dim] = transform(
                 samples[:, i_dim], t, bounds=bounds[:, i_dim]
             )
+        #queries_transformed = transform_3d(samples, self.tiling, bounds)
+
         sdf_values = self.microtile(queries_transformed)
 
         return sdf_values
@@ -258,6 +260,40 @@ def transform(x, t, bounds=[0, 1]):
     x_norm = (x - bounds[0]) / (bounds[1] - bounds[0])
     x_transformed = 2 * _torch.abs(t * x_norm / 2 - _torch.floor((t * x_norm + 1) / 2))
     return 2 * x_transformed - 1
+    #return 2 * x_norm - 1
+
+def transform_1d(x, t, bounds):
+    """
+    x: (N,)
+    t: number of cells along this axis
+    bounds: tensor/list like [min, max] for this axis
+    returns: (N,2) -> [sin, cos]
+    """
+    if not _torch.is_tensor(bounds):
+        bounds = _torch.tensor(bounds, device=x.device, dtype=x.dtype)
+    else:
+        bounds = bounds.to(device=x.device, dtype=x.dtype)
+
+    cell_size = (bounds[1] - bounds[0]) / t
+    phase = 2 * _torch.pi * (x - bounds[0]) / cell_size  
+    return _torch.stack([_torch.sin(phase), _torch.cos(phase)], dim=-1)
+
+def transform_3d(samples, tiling, bounds):
+    """
+    samples: (N,3)
+    tiling: (3,) number of cells per axis
+    bounds: (2,3) with min row and max row
+    returns: (N,6)
+    """
+    N = samples.shape[0]
+    out = samples.new_empty(N, 6)
+
+    for i_dim in range(3):
+        sc = transform_1d(samples[:, i_dim], tiling[i_dim], bounds[:, i_dim]) 
+        out[:, 2*i_dim:2*i_dim+2] = sc 
+
+    return out
+    
 
 
 def check_tiling_input(tiling):

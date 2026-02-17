@@ -215,9 +215,9 @@ class SDFBase(torch.nn.Module, ABC):
 
     def _validate_input(self, queries: torch.Tensor):
         # Example check: 2D tensor with shape (N, 3) or (N, 2where N points, each point is a column vector
-        if queries.ndim != 2 or (queries.shape[1] not in [2, 3]):
+        if queries.ndim != 2 or (queries.shape[1] not in [2, 3, 6]):
             raise ValueError(
-                f"Expected input of shape (N, 3) or (N, 2), got {queries.shape}"
+                f"Expected input of shape (N, 3) or (N, 2) or (N, 6), got {queries.shape}"
             )
 
     def get_device(self):
