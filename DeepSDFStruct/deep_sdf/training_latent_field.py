@@ -17,6 +17,7 @@ import socket
 import numpy as np
 import torch
 import torch.utils.data as data_utils
+from importlib.metadata import version
 
 import splinepy
 
@@ -29,6 +30,12 @@ from DeepSDFStruct.SDF import SDFfromDeepSDF
 from DeepSDFStruct.lattice_structure import LatticeSDFStruct
 from DeepSDFStruct.parametrization import SplineParametrization
 from DeepSDFStruct.deep_sdf.plotting import plot_logs
+from DeepSDFStruct.mesh import create_3D_mesh, export_surface_mesh
+from DeepSDFStruct.deep_sdf.data import SDFSamples
+
+import mlflow
+import mlflow.pytorch
+
 
 logger = logging.getLogger(DeepSDFStruct.__name__)
 
@@ -299,17 +306,79 @@ def append_parameter_magnitudes(param_mag_log, model):
         param_mag_log[name].append(param.data.norm().item())
 
 
-def train(experiment_directory, data_source=None, continue_from=None, device=None):
+def train(
+    experiment_directory,
+    data_source=None,
+    continue_from=None,
+    device=None,
+    use_mlflow: bool = False,
+    mlflow_run_name: str | None = None,
+    mlflow_tags: dict | None = None,
+    mlflow_log_every_n_batches: int = 50,
+):
     """
     Train decoder + spline latent fields.
     """
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S"
+        level=logging.INFO,
+        format="%(asctime)s %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,   # <-- IMPORTANT (Python 3.8+)
     )
     logging.debug("running " + experiment_directory)
     experiment_directory = str(experiment_directory)
     specs = ws.load_experiment_specifications(experiment_directory)
     logging.info("Experiment description: \n" + specs["Description"])
+    run_ctx = None
+    use_mlflow = bool(use_mlflow) and (mlflow.active_run() is not None)
+    if use_mlflow:
+        if mlflow_tags:
+            mlflow.set_tags(mlflow_tags)
+
+        # Core params from specs.json
+        mlflow.log_param("Description", specs.get("Description", ""))
+        mlflow.log_param("DataSource", specs.get("DataSource", ""))
+        mlflow.log_param("TrainSplit", specs.get("TrainSplit", ""))
+        mlflow.log_param("NetworkArch", specs.get("NetworkArch", ""))
+
+        mlflow.log_param("CodeLength", specs.get("CodeLength", None))
+        mlflow.log_param("NumEpochs", specs.get("NumEpochs", None))
+        mlflow.log_param("SamplesPerScene", specs.get("SamplesPerScene", None))
+        mlflow.log_param("ScenesPerBatch", specs.get("ScenesPerBatch", None))
+        mlflow.log_param("DataLoaderThreads", specs.get("DataLoaderThreads", None))
+
+        mlflow.log_param("ClampingDistance", specs.get("ClampingDistance", None))
+        mlflow.log_param(
+            "CodeRegularizationLambda", specs.get("CodeRegularizationLambda", None)
+        )
+        mlflow.log_param("CodeBound", specs.get("CodeBound", None))
+
+        mlflow.log_param("Tiling", json.dumps(specs.get("Tiling", None)))
+        mlflow.log_param(
+            "BoundsParamSpace", json.dumps(specs.get("BoundsParamSpace", None))
+        )
+        mlflow.log_param("SplineInitStd", specs.get("SplineInitStd", None))
+        mlflow.log_param("SplineDegrees", json.dumps(specs.get("SplineDegrees", None)))
+        mlflow.log_param(
+            "LearningRateSchedule", json.dumps(specs.get("LearningRateSchedule", None))
+        )
+
+        # NetworkSpecs (a few highlights)
+        ns = specs.get("NetworkSpecs", {})
+        mlflow.log_param("geom_dimension", ns.get("geom_dimension", None))
+        mlflow.log_param("dims", json.dumps(ns.get("dims", None)))
+        mlflow.log_param("use_tanh", ns.get("use_tanh", None))
+        mlflow.log_param("weight_norm", ns.get("weight_norm", None))
+
+        # Runtime params
+        mlflow.log_param("device", str(device))
+
+        # Log the full specs as artifact (best reproducibility)
+        specs_dump_path = os.path.join(experiment_directory, "mlflow_specs_dump.json")
+        with open(specs_dump_path, "w") as f:
+            json.dump(specs, f, indent=2)
+        mlflow.log_artifact(specs_dump_path)
+
     if data_source is None:
         data_source = specs["DataSource"]
 
@@ -563,6 +632,7 @@ def train(experiment_directory, data_source=None, continue_from=None, device=Non
     param_mag_log = {}
 
     start_train = time.time()
+    global_step = 0
     for epoch in range(start_epoch, num_epochs + 1):
         start = time.time()
         adjust_learning_rate(epoch)
@@ -570,6 +640,7 @@ def train(experiment_directory, data_source=None, continue_from=None, device=Non
         epoch_loss = 0.0
         epoch_reg = 0.0
         n_batches = 0
+        epoch_error = 0.0
 
         for sdf_data, properties, indices in sdf_loader:
             # sdf_data: (ScenesPerBatch, SamplesPerScene, geom_dim+1)
@@ -629,6 +700,14 @@ def train(experiment_directory, data_source=None, continue_from=None, device=Non
                 batch_reg += float(reg.detach().item())
 
             optimizer_all.step()
+            epoch_error += batch_loss
+            if use_mlflow and (global_step % mlflow_log_every_n_batches == 0):
+                # log batch-level metrics
+                mlflow.log_metrics(
+                    {"batch_loss": float(batch_loss), "batch_reg": float(batch_reg)},
+                    step=global_step,
+                )
+            global_step += 1
 
             end = time.time()
             seconds_elapsed = end - start
@@ -643,6 +722,7 @@ def train(experiment_directory, data_source=None, continue_from=None, device=Non
         avg_loss = epoch_loss / max(1, n_batches)
         avg_reg = epoch_reg / max(1, n_batches)
 
+        error = epoch_error / len(sdf_loader)
         tot_time = time.time() - start_train
         avg_time_per_epoch = tot_time / (epoch)
         estimated_remaining_time = avg_time_per_epoch * (num_epochs - (epoch))
@@ -672,6 +752,18 @@ def train(experiment_directory, data_source=None, continue_from=None, device=Non
 
         append_parameter_magnitudes(param_mag_log, decoder)
 
+        if use_mlflow:
+            mlflow.log_metrics(
+                {
+                    "epoch_loss": float(avg_loss),
+                    "epoch_reg": float(avg_reg),
+                    "latent_field_mean_param_norm": float(lat_mag_log[-1]),
+                    "lr_decoder": float(optimizer_all.param_groups[0]["lr"]),
+                    "lr_latent_fields": float(optimizer_all.param_groups[1]["lr"]),
+                },
+                step=int(epoch),
+            )
+
         if epoch in checkpoints:
             save_checkpoints(epoch)
 
@@ -687,14 +779,194 @@ def train(experiment_directory, data_source=None, continue_from=None, device=Non
                 epoch,
             )
 
+        if use_mlflow and (epoch % log_frequency == 0):
+            # logs + plot
+            logs_path = os.path.join(experiment_directory, ws.logs_filename)
+            logplot_path = os.path.join(experiment_directory, ws.logplot_filename)
+            if os.path.isfile(logs_path):
+                mlflow.log_artifact(logs_path)
+            if os.path.isfile(logplot_path):
+                mlflow.log_artifact(logplot_path)
+
+            # checkpoints you just saved
+            model_params_dir = ws.get_model_params_dir(
+                experiment_directory, create_if_nonexistent=False
+            )
+            optim_dir = ws.get_optimizer_params_dir(
+                experiment_directory, create_if_nonexistent=False
+            )
+            lat_dir = ws.get_latent_codes_dir(
+                experiment_directory, create_if_nonexistent=False
+            )
+
+            for p in [
+                os.path.join(model_params_dir, "latest.pth"),
+                os.path.join(optim_dir, "latest.pth"),
+                os.path.join(lat_dir, "latest.pth"),
+            ]:
+                if os.path.isfile(p):
+                    mlflow.log_artifact(p)
+
+    summary = ws.ExperimentSummary(
+        loss=error,
+        num_epochs=epoch,
+        timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        host_name=host_name,
+        device=str(device),
+        training_duration=total_time,
+        data_dir=str(data_source),
+        version=version("DeepSDFStruct"),
+    )
+    ws.save_experiment_summary(experiment_directory, summary)
+
+    return summary
+
+
+def export_training_latent_fields_to_stl(
+    experiment_directory: str,
+    checkpoint: str = "latest.pth",
+    out_dir: str | None = None,
+    N_base: int = 32,
+    device: str | None = None,
+    overwrite: bool = False,
+    max_scenes: int | None = None,
+):
+    """
+    Export one STL per training scene using the *trained spline latent fields* (control points),
+    and the trained decoder weights at `checkpoint`.
+
+    Uses the same geometry pipeline as test_reconstruction.py:
+      SDFfromDeepSDF -> LatticeSDFStruct -> create_3D_mesh -> export_surface_mesh
+    """
+    experiment_directory = str(experiment_directory)
+    specs = ws.load_experiment_specifications(experiment_directory)
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # where to save
+    if out_dir is None:
+        out_dir = os.path.join(experiment_directory, "reconstructions_latent_field")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # load decoder checkpoint
+    # NOTE: ws.load_trained_model usually expects checkpoint without ".pth" (often "latest"),
+    # but your training scripts save filenames like "latest.pth".
+    # We'll accept both.
+    ckpt_name = checkpoint
+    ckpt_noext = checkpoint[:-4] if checkpoint.endswith(".pth") else checkpoint
+
+    decoder = ws.load_trained_model(experiment_directory, ckpt_noext, device=device)
+    decoder.eval()
+    geom_dimension = decoder.geom_dimension
+
+    latent_size = specs["CodeLength"]
+    latent_dim = (
+        int(torch.tensor(latent_size).sum().item())
+        if isinstance(latent_size, list)
+        else int(latent_size)
+    )
+
+    tiling = get_spec_with_default(specs, "Tiling", [1, 1, 1])
+    if len(tiling) != geom_dimension:
+        raise ValueError(
+            f"Tiling length must match geom_dimension={geom_dimension}. Got {tiling}"
+        )
+
+    bounds_param_space = get_spec_with_default(
+        specs, "BoundsParamSpace", [[-1.0] * geom_dimension, [1.0] * geom_dimension]
+    )
+    bounds_param_space_t = torch.tensor(
+        bounds_param_space, dtype=torch.float32, device=device
+    )
+
+    spline_init_std = float(get_spec_with_default(specs, "SplineInitStd", 0.01))
+    spline_degrees = get_spec_with_default(specs, "SplineDegrees", None)
+
+    # determine number of scenes from the training split (same as in train())
+    data_source = specs["DataSource"]
+    train_split_file = pathlib.Path(data_source) / specs["TrainSplit"]
+    with open(train_split_file, "r") as f:
+        train_split = json.load(f)
+
+    # We only need dataset length + (optional) filenames.
+    # SDFSamples.__len__ equals number of scenes. :contentReference[oaicite:3]{index=3}
+    sdf_dataset = SDFSamples(
+        data_source,
+        train_split,
+        subsample=1,  # not used here
+        load_ram=False,  # we won't draw samples here
+        geom_dimension=geom_dimension,
+    )
+    num_scenes = len(sdf_dataset)
+
+    # build latent fields container and load CPs
+    latent_fields = make_latent_fields(
+        num_scenes=num_scenes,
+        latent_dim=latent_dim,
+        tiling=tiling,
+        device=device,
+        init_std=spline_init_std,
+        degrees=spline_degrees,
+    )
+    _ = load_latent_fields(
+        experiment_directory, ckpt_name, latent_fields, device=device
+    )
+    latent_fields.eval()
+
+    # DeepSDFModel needs a tensor library just to define latent_dim
+    dummy_latents = torch.zeros((1, latent_dim), device=device, dtype=torch.float32)
+    deep_sdf_model = DeepSDFModel(decoder, dummy_latents, device=device)
+    microtile = SDFfromDeepSDF(deep_sdf_model)
+
+    # export
+    for sid in range(num_scenes):
+        if sid == max_scenes:
+            print(f"Reached max_scenes={max_scenes}, stopping.")
+            break
+        out_path = os.path.join(out_dir, f"scene_{sid:05d}.stl")
+        if (not overwrite) and os.path.isfile(out_path):
+            print(f"[skip] {out_path}")
+            continue
+
+        struct = LatticeSDFStruct(
+            tiling=tiling,
+            microtile=microtile,
+            parametrization=latent_fields[sid],
+            bounds=bounds_param_space,
+        )
+
+        # Create mesh in param space bounds (same pattern as test_reconstruction.py)
+        surf_mesh, derivative = create_3D_mesh(
+            struct,
+            int(N_base),
+            differentiate=False,
+            device=device,
+            mesh_type="surface",
+            bounds=bounds_param_space_t,
+            deformation_function=None,
+        )
+
+        export_surface_mesh(out_path, surf_mesh.to_gus(), derivative)
+        print(f"[ok] {out_path}")
+
 
 if __name__ == "__main__":
-    import argparse
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
 
-    experiment_directory = "confidential/test_training_spline_sand"
+    experiment_directory = "confidential/test_training_spline_more_ep_check"
 
     train(experiment_directory, data_source=None, continue_from=None, device=None)
+
+    # export_training_latent_fields_to_stl(
+    #     experiment_directory,
+    #     checkpoint="latest.pth",
+    #     out_dir=None,
+    #     N_base=8,
+    #     device=None,
+    #     overwrite=True,
+    #     max_scenes=3,
+    # )
