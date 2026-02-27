@@ -747,9 +747,9 @@ def create_3D_mesh(
     if bounds is None:
         bounds = sdf._get_domain_bounds()
     extended_bounds = bounds.clone()
-    off = (extended_bounds[1] - extended_bounds[0]) * 0.05
-    extended_bounds[0] -= off
-    extended_bounds[1] += off
+    # off = (extended_bounds[1] - extended_bounds[0]) * 0.05
+    # extended_bounds[0] -= off
+    # extended_bounds[1] += off
 
     N = process_N_base_input(N_base, tiling)
 

@@ -59,6 +59,12 @@ def reconstruct_from_samples(
         print(f"{name}: min={mn:.6f}, max={mx:.6f}")
 
     gt_dist = sdfSample.distances
+    max_abs = gt_dist.abs().max()
+    gt_dist = gt_dist / max_abs
+    print(f"\nMax absolute SDF value before normalization: {max_abs:.6f}")
+    print(f"Max absolute SDF value after normalization: {gt_dist.abs().max():.6f}")
+
+
     if use_tanh_on_gt:
         gt_dist = torch.tanh(gt_dist)
 

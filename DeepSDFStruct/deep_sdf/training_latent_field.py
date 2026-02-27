@@ -230,17 +230,9 @@ def load_latent_fields(experiment_directory, filename, latent_fields, device):
     return int(data.get("epoch", 0))
 
 
-def build_template_spline(latent_dim, tiling, degrees=None):
+def build_template_spline(latent_dim, tiling, bounds, degrees=None):
     """
-    Builds a splinepy.BSpline in [0,1]^d with a control point grid that matches tiling.
-
-    Strategy:
-      - start with degrees=[1]*d and knot vectors [0,0,1,1] (2 CP per dim)
-      - insert (tiling[i]-1) internal knots uniformly for each dim
-      - final CP count becomes (tiling[i]+1) per dim for degree=1
-
-    Returns:
-      template spline (splinepy.BSpline) after knot insertion
+    Builds a splinepy.BSpline in [mins,maxs]^d with a control point grid that matches tiling.
     """
     dim = len(tiling)
     if degrees is None:
@@ -248,31 +240,43 @@ def build_template_spline(latent_dim, tiling, degrees=None):
     if len(degrees) != dim:
         raise ValueError(f"degrees must have length {dim}, got {degrees}")
 
-    # start spline
-    knot_vectors = [[0.0, 0.0, 1.0, 1.0] for _ in range(dim)]
-    ncp0 = int(np.prod([d + 1 for d in degrees]))
+    # bounds: (2, dim) -> mins/maxs
+    # bounds_np = np.asarray(bounds, dtype=float)
+    mins = bounds[0].detach().cpu().numpy()
+    maxs = bounds[1].detach().cpu().numpy()
+
+    # clamped knot vectors per dim: [min]*(p+1) + [max]*(p+1)
+    knot_vectors = []
+    for i in range(dim):
+        p = int(degrees[i])
+        kv = [float(mins[i])] * (p + 1) + [float(maxs[i])] * (p + 1)
+        knot_vectors.append(kv)
+
+    # initial CP count = prod(p+1)
+    ncp0 = int(np.prod([p + 1 for p in degrees]))
     control_points = [[0.0] * int(latent_dim) for _ in range(ncp0)]
 
     sp = splinepy.BSpline(degrees, knot_vectors, control_points)
 
+    # insert internal knots in [min,max] like reconstruction script
     for i_dim, n_box in enumerate(tiling):
         n_box = int(n_box)
         if n_box == 1:
             continue
-        knots = np.linspace(0.0, 1.0, n_box + 1)[1:-1]
+        knots = np.linspace(mins[i_dim], maxs[i_dim], n_box + 1)[1:-1]
         sp.insert_knots(i_dim, knots)
 
     return sp
 
 
 def make_latent_fields(
-    num_scenes, latent_dim, tiling, device, init_std=0.01, degrees=None
+    num_scenes, latent_dim, tiling, bounds, device, init_std=0.01, degrees=None
 ):
     """
     Create one SplineParametrization (with learnable control points) per scene.
     All splines share identical topology (degrees/knot vectors/control point count).
     """
-    template = build_template_spline(latent_dim, tiling, degrees=degrees)
+    template = build_template_spline(latent_dim, tiling, bounds, degrees=degrees)
     deg = list(template.degrees)
     kvs = [list(kv) for kv in template.knot_vectors]
     ncp = int(np.asarray(template.control_points).shape[0])
@@ -323,7 +327,7 @@ def train(
         level=logging.INFO,
         format="%(asctime)s %(message)s",
         datefmt="%H:%M:%S",
-        force=True,   # <-- IMPORTANT (Python 3.8+)
+        force=True,  # <-- IMPORTANT (Python 3.8+)
     )
     logging.debug("running " + experiment_directory)
     experiment_directory = str(experiment_directory)
@@ -521,6 +525,7 @@ def train(
         num_scenes=num_scenes,
         latent_dim=latent_dim,
         tiling=tiling,
+        bounds=bounds_param_space,
         device=device,
         init_std=spline_init_std,
         degrees=spline_degrees,
@@ -687,13 +692,27 @@ def train(
                 loss = loss_fn(pred, sdf_i)
 
                 # L2 regularization on *used* latent fields' parameters (control points)
+                # reg = 0.0
+                # for sid in idx_i.unique():
+                #     sid_int = int(sid.item())
+                #     for p in latent_fields[sid_int].parameters():
+                #         reg = reg + (p**2).mean()
+                # loss_total = loss + code_reg_lambda * reg
+                
                 reg = 0.0
+                count = 0
                 for sid in idx_i.unique():
-                    sid_int = int(sid.item())
-                    for p in latent_fields[sid_int].parameters():
-                        reg = reg + (p**2).mean()
+                    for p in latent_fields[sid].parameters():
+                        reg = reg + p.pow(2).mean()
+                        count += 1
 
-                loss_total = loss + code_reg_lambda * reg
+                reg = reg / max(
+                    count, 1
+                )  # normalize so it doesn't depend on how many params you loop
+                warmup = min(1.0, epoch / 100.0)
+                loss_total = loss + code_reg_lambda * warmup * reg
+
+                
                 loss_total.backward()
 
                 batch_loss += float(loss.detach().item())
@@ -905,6 +924,7 @@ def export_training_latent_fields_to_stl(
         num_scenes=num_scenes,
         latent_dim=latent_dim,
         tiling=tiling,
+        bounds=bounds_param_space_t,
         device=device,
         init_std=spline_init_std,
         degrees=spline_degrees,
@@ -957,16 +977,16 @@ if __name__ == "__main__":
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
 
-    experiment_directory = "confidential/test_training_spline_more_ep_check"
+    experiment_directory = "confidential/primitives_latent_field"
 
-    train(experiment_directory, data_source=None, continue_from=None, device=None)
+    # train(experiment_directory, data_source=None, continue_from=None, device=None)
 
-    # export_training_latent_fields_to_stl(
-    #     experiment_directory,
-    #     checkpoint="latest.pth",
-    #     out_dir=None,
-    #     N_base=8,
-    #     device=None,
-    #     overwrite=True,
-    #     max_scenes=3,
-    # )
+    export_training_latent_fields_to_stl(
+        experiment_directory,
+        checkpoint="1000.pth",
+        out_dir=None,
+        N_base=8,
+        device=None,
+        overwrite=True,
+        max_scenes=3,
+    )
