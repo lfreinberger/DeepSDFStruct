@@ -61,7 +61,7 @@ def test_shape_reconstruction():
 
     SDF_samples = uniform_samples + surface_samples
 
-    recon_param = reconstruct_from_samples(
+    recon_result = reconstruct_from_samples(
         struct,
         SDF_samples,
         lr=5e-3,

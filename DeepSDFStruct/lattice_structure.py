@@ -23,6 +23,7 @@ Key Features
 """
 
 import logging
+import warnings
 
 
 import numpy as _np
@@ -192,9 +193,8 @@ class LatticeSDFStruct(_SDFBase):
         """
         bounds = self._get_domain_bounds()
         if self.parametrization is not None:
-            samples_parameter_space = (samples - bounds[0]) / (bounds[1] - bounds[0])
-            samples_parameter_space = _torch.clamp(samples_parameter_space, 0.0, 1.0)
-            parameters = self.parametrization(samples_parameter_space)
+            samples_clamped = _torch.clamp(samples, bounds[0], bounds[1])
+            parameters = self.parametrization(samples_clamped)
             self.microtile._set_param(parameters)
 
         queries_transformed = _torch.zeros_like(samples)
@@ -202,7 +202,18 @@ class LatticeSDFStruct(_SDFBase):
             queries_transformed[:, i_dim] = transform(
                 samples[:, i_dim], t, bounds=bounds[:, i_dim]
             )
+
         sdf_values = self.microtile(queries_transformed)
+
+        # For points outside the domain bounds, blend toward exterior (positive
+        # SDF) so that FlexiCubes mesh extraction with extended bounds does not
+        # produce artifacts from partial periodic tiles.
+        lower_dist = bounds[0] - samples  # positive when outside (below lower)
+        upper_dist = samples - bounds[1]  # positive when outside (above upper)
+        outside_dist = _torch.max(
+            _torch.max(lower_dist, dim=-1).values, _torch.max(upper_dist, dim=-1).values
+        ).unsqueeze(-1)
+        sdf_values = _torch.maximum(sdf_values, outside_dist)
 
         return sdf_values
 
