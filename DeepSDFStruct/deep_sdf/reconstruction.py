@@ -19,8 +19,12 @@ def reconstruct_from_samples(
     drop_last=True,
     use_tanh_on_gt=False,
     loss_plot_path=None,
+    loss_csv_path=None,
     optimizer_name="adam",
     deformation_function=None | TorchSpline | TorchScaling,
+    use_mlflow: bool = False,
+    mlflow_metric_prefix: str = "reconstruction",
+    mlflow_log_every_n_steps: int = 10,
 ):
     if optimizer_name == "adam":
         optimizer = torch.optim.Adam(sdf.parameters(), lr=lr)
@@ -28,8 +32,8 @@ def reconstruct_from_samples(
         optimizer = torch.optim.LBFGS(
             sdf.parameters(),
             lr=lr,
-            max_iter=20,  # inner Newton iterations
-            history_size=100,  # curvature memory
+            max_iter=20,
+            history_size=100,
             line_search_fn="strong_wolfe",
         )
     else:
@@ -59,11 +63,7 @@ def reconstruct_from_samples(
         print(f"{name}: min={mn:.6f}, max={mx:.6f}")
 
     gt_dist = sdfSample.distances
-    max_abs = gt_dist.abs().max()
-    gt_dist = gt_dist / max_abs
-    print(f"\nMax absolute SDF value before normalization: {max_abs:.6f}")
-    print(f"Max absolute SDF value after normalization: {gt_dist.abs().max():.6f}")
-
+    print(f"\nMax absolute SDF value: {gt_dist.abs().max():.6f}")
 
     if use_tanh_on_gt:
         gt_dist = torch.tanh(gt_dist)
@@ -84,10 +84,11 @@ def reconstruct_from_samples(
         print(
             "Warning: drop_last was set to true, "
             f"but batch size ({batch_size}) is larger "
-            f"than the size of the dataset ({len(dataset)})."
-            " setting drop_last=False"
+            f"than the size of the dataset ({len(dataset)}). "
+            "Setting drop_last=False"
         )
         drop_last = False
+
     dataloader = DataLoader(
         dataset, batch_size=batch_size, shuffle=True, drop_last=drop_last
     )
@@ -114,10 +115,19 @@ def reconstruct_from_samples(
 
     if loss_plot_path is not None:
         plot_reconstruction_loss(
-            loss_history, iters_per_epoch=len(dataloader), filename=loss_plot_path
+            loss_history,
+            iters_per_epoch=len(dataloader),
+            filename=loss_plot_path,
+            csv_filename=loss_csv_path,
         )
 
     params = list(sdf.parameters())
-    print(params)
 
-    return params
+    result = {
+        "params": params,
+        "loss_history": loss_history,
+        "final_loss": float(loss_history[-1]) if loss_history else None,
+        "num_steps": len(loss_history),
+    }
+
+    return result
