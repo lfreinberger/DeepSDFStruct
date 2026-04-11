@@ -662,6 +662,7 @@ def create_3D_mesh(
     bounds=None,
     diffmode="fwd",
     deformation_function: None | TorchSpline | TorchScaling = None,
+    use_tiling=True,
 ) -> Tuple[Union[torchSurfMesh, torchVolumeMesh], Optional[_torch.Tensor]]:
     """Generate a 3D mesh from an SDF using FlexiCubes dual contouring.
 
@@ -729,7 +730,10 @@ def create_3D_mesh(
     For lattice structures, the resolution is automatically scaled by the
     tiling factor to maintain consistent resolution per unit cell.
     """
-    lattice = find_lattice_sdf(sdf)
+    if use_tiling:
+        lattice = find_lattice_sdf(sdf)
+    else:
+        lattice = None
     if lattice is None:
         tiling = _torch.tensor([1, 1, 1])
     else:
@@ -747,9 +751,9 @@ def create_3D_mesh(
     if bounds is None:
         bounds = sdf._get_domain_bounds()
     extended_bounds = bounds.clone()
-    # off = (extended_bounds[1] - extended_bounds[0]) * 0.05
-    # extended_bounds[0] -= off
-    # extended_bounds[1] += off
+    off = (extended_bounds[1] - extended_bounds[0]) * 0.05
+    extended_bounds[0] -= off
+    extended_bounds[1] += off
 
     N = process_N_base_input(N_base, tiling)
 

@@ -23,6 +23,7 @@ Key Features
 """
 
 import logging
+import warnings
 
 
 import numpy as _np
@@ -192,15 +193,8 @@ class LatticeSDFStruct(_SDFBase):
         """
         bounds = self._get_domain_bounds()
         if self.parametrization is not None:
-            #samples_parameter_space = (samples - bounds[0]) / (bounds[1] - bounds[0])
-            # if samples.min() < 0.0 or samples.max() > 1.0:
-            #     raise ValueError(
-            #         "Samples of the lattice structure are outside [0,1]. Make sure to transform the samples accordingly in the parametrization function."
-            #     )
-            #samples_parameter_space = _torch.clamp(samples_parameter_space, 0.0, 1.0)
-            # samples_parameter_space = _torch.clamp(samples, 0.0, 1.0)
-            #parameters = self.parametrization(samples_parameter_space)
-            parameters = self.parametrization(samples)
+            samples_clamped = _torch.clamp(samples, bounds[0], bounds[1])
+            parameters = self.parametrization(samples_clamped)
             self.microtile._set_param(parameters)
 
         queries_transformed = _torch.zeros_like(samples)
@@ -208,9 +202,18 @@ class LatticeSDFStruct(_SDFBase):
             queries_transformed[:, i_dim] = transform(
                 samples[:, i_dim], t, bounds=bounds[:, i_dim]
             )
-        # queries_transformed = transform_3d(samples, self.tiling, bounds)
 
         sdf_values = self.microtile(queries_transformed)
+
+        # For points outside the domain bounds, blend toward exterior (positive
+        # SDF) so that FlexiCubes mesh extraction with extended bounds does not
+        # produce artifacts from partial periodic tiles.
+        lower_dist = bounds[0] - samples  # positive when outside (below lower)
+        upper_dist = samples - bounds[1]  # positive when outside (above upper)
+        outside_dist = _torch.max(
+            _torch.max(lower_dist, dim=-1).values, _torch.max(upper_dist, dim=-1).values
+        ).unsqueeze(-1)
+        sdf_values = _torch.maximum(sdf_values, outside_dist)
 
         return sdf_values
 
@@ -266,44 +269,6 @@ def transform(x, t, bounds=[0, 1]):
     x_norm = (x - bounds[0]) / (bounds[1] - bounds[0])
     x_transformed = 2 * _torch.abs(t * x_norm / 2 - _torch.floor((t * x_norm + 1) / 2))
     return 2 * x_transformed - 1
-    #return 2 * x_norm - 1
-
-def transform_cos(x, t, bounds=(0,1)):
-    x = (x - bounds[0]) / (bounds[1] - bounds[0])
-    return -_torch.cos(_torch.pi * t * x)
-
-def transform_1d(x, t, bounds):
-    """
-    x: (N,)
-    t: number of cells along this axis
-    bounds: tensor/list like [min, max] for this axis
-    returns: (N,2) -> [sin, cos]
-    """
-    if not _torch.is_tensor(bounds):
-        bounds = _torch.tensor(bounds, device=x.device, dtype=x.dtype)
-    else:
-        bounds = bounds.to(device=x.device, dtype=x.dtype)
-
-    cell_size = (bounds[1] - bounds[0]) / t
-    phase = 2 * _torch.pi * (x - bounds[0]) / cell_size
-    return _torch.stack([_torch.sin(phase), _torch.cos(phase)], dim=-1)
-
-
-def transform_3d(samples, tiling, bounds):
-    """
-    samples: (N,3)
-    tiling: (3,) number of cells per axis
-    bounds: (2,3) with min row and max row
-    returns: (N,6)
-    """
-    N = samples.shape[0]
-    out = samples.new_empty(N, 6)
-
-    for i_dim in range(3):
-        sc = transform_1d(samples[:, i_dim], tiling[i_dim], bounds[:, i_dim])
-        out[:, 2 * i_dim : 2 * i_dim + 2] = sc
-
-    return out
 
 
 def check_tiling_input(tiling):
