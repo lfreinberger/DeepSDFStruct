@@ -36,7 +36,6 @@ from DeepSDFStruct.deep_sdf.data import SDFSamples
 import mlflow
 import mlflow.pytorch
 
-
 logger = logging.getLogger(DeepSDFStruct.__name__)
 
 
@@ -386,8 +385,14 @@ def train(
     if data_source is None:
         data_source = specs["DataSource"]
 
+    is_quantum = specs.get("NetworkArch", "") == "quantum_deep_sdf_decoder"
+
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        # QNN statevector simulation gets no benefit from GPU at small qubit
+        # counts — lightning.qubit runs faster on CPU.
+        device = (
+            "cpu" if is_quantum else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
 
     host_name = socket.gethostname()
     logging.info(f"training on {host_name} with {device}")
@@ -405,7 +410,8 @@ def train(
 
     log_frequency = get_spec_with_default(specs, "LogFrequency", 10)
 
-    data_parallel = torch.cuda.device_count() > 1
+    # DataParallel is not supported for QNN (lightning.qubit is not GPU-aware).
+    data_parallel = (not is_quantum) and torch.cuda.device_count() > 1
     decoder = ws.init_decoder(specs, device, data_parallel)
     geom_dimension = decoder.geom_dimension
 
@@ -698,7 +704,7 @@ def train(
                 #     for p in latent_fields[sid_int].parameters():
                 #         reg = reg + (p**2).mean()
                 # loss_total = loss + code_reg_lambda * reg
-                
+
                 reg = 0.0
                 count = 0
                 for sid in idx_i.unique():
@@ -712,7 +718,6 @@ def train(
                 warmup = min(1.0, epoch / 100.0)
                 loss_total = loss + code_reg_lambda * warmup * reg
 
-                
                 loss_total.backward()
 
                 batch_loss += float(loss.detach().item())
@@ -969,24 +974,3 @@ def export_training_latent_fields_to_stl(
 
         export_surface_mesh(out_path, surf_mesh.to_gus(), derivative)
         print(f"[ok] {out_path}")
-
-
-if __name__ == "__main__":
-
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
-    )
-
-    experiment_directory = "confidential/primitives_latent_field"
-
-    # train(experiment_directory, data_source=None, continue_from=None, device=None)
-
-    export_training_latent_fields_to_stl(
-        experiment_directory,
-        checkpoint="1000.pth",
-        out_dir=None,
-        N_base=8,
-        device=None,
-        overwrite=True,
-        max_scenes=3,
-    )
