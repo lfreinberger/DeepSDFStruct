@@ -250,18 +250,22 @@ class MMA:
            https://github.com/arjendeetman/mmapy
     """
 
-    def __init__(self, parameters, bounds, max_step=0.1):
+    def __init__(self, parameters, bounds, max_step=0.1, n_constraints=1):
         self.max_step = max_step
-        self.bounds = np.array(bounds)
+        self.bounds = np.asarray(bounds, dtype=float)
         self.parameters = parameters
-        self.m = 1
-        self.n = len(parameters)
-        self.x = parameters.detach().cpu().numpy()
-        self.xold1 = parameters.detach().cpu().numpy()
-        self.xold2 = parameters.detach().cpu().numpy()
-        self.low = []
-        self.upp = []
-        self.a0_MMA = 1
+
+        self.m = n_constraints
+        self.n = parameters.numel()
+
+        self.x = parameters.detach().cpu().numpy().reshape(-1, 1)
+        self.xold1 = self.x.copy()
+        self.xold2 = self.x.copy()
+
+        self.low = np.zeros((self.n, 1))
+        self.upp = np.zeros((self.n, 1))
+
+        self.a0_MMA = 1.0
         self.a_MMA = np.zeros((self.m, 1))
         self.c_MMA = 10000 * np.ones((self.m, 1))
         self.d_MMA = np.zeros((self.m, 1))
@@ -298,20 +302,25 @@ class MMA:
 
         The convergence metric ch is the relative change in design variables.
         """
-        orig_shape = dF.shape
-        F_np = F.detach().cpu().numpy().reshape(-1, 1)
-        dFdx_np = dF.detach().cpu().numpy().reshape(-1, 1)
-        G_np = G.detach().cpu().numpy().reshape(-1, 1)
-        dGdx_np = dG.detach().cpu().numpy().reshape(1, -1)
+        F_np = np.asarray(F.detach().cpu().numpy(), dtype=float).reshape(1, 1)
+        dFdx_np = np.asarray(dF.detach().cpu().numpy(), dtype=float).reshape(self.n, 1)
+
+        G_np = np.asarray(G.detach().cpu().numpy(), dtype=float).reshape(self.m, 1)
+        dGdx_np = np.asarray(dG.detach().cpu().numpy(), dtype=float).reshape(
+            self.m, self.n
+        )
+
         if self.loop == 0:
-            self.F0 = F_np
+            self.F0 = F_np.copy()
+
         F_np = F_np / self.F0
         dFdx_np = dFdx_np / self.F0
 
-        xmin = np.maximum(self.x - self.max_step, self.bounds[:, 0].reshape(-1, 1))
-        xmax = np.minimum(self.x + self.max_step, self.bounds[:, 1].reshape(-1, 1))
-        move = 0.1
-        self.loop = self.loop + 1
+        xmin = np.maximum(self.x - self.max_step, self.bounds[:, 0:1])
+        xmax = np.minimum(self.x + self.max_step, self.bounds[:, 1:2])
+
+        self.loop += 1
+
         xmma, ymma, zmma, lam, xsi, eta, muMMA, zet, s, low, upp = mmasub(
             self.m,
             self.n,
@@ -336,18 +345,21 @@ class MMA:
         self.xold2 = self.xold1.copy()
         self.xold1 = self.x.copy()
         self.x = xmma
-        self.upp = upp
         self.low = low
+        self.upp = upp
 
-        ch = np.abs(np.mean(self.x.T - self.xold1.T) / np.mean(self.x.T))
+        self.ch = np.abs(np.mean(self.x.T - self.xold1.T) / np.mean(self.x.T))
+
         with torch.no_grad():
             self.parameters.copy_(
                 torch.tensor(
-                    xmma, dtype=self.parameters.dtype, device=self.parameters.device
+                    xmma.reshape(self.parameters.shape),
+                    dtype=self.parameters.dtype,
+                    device=self.parameters.device,
                 )
             )
+
         logger.info(
-            "It.: {0:4} | J.: {1:1.3e} | Constr.:  {2:1.3e} | ch.: {3:1.3e}".format(
-                self.loop, F_np[0][0], G_np[0][0], ch
-            )
+            f"It.: {self.loop:4d} | J.: {F_np[0,0]:1.3e} | "
+            f"G: {[float(g) for g in G_np[:, 0]]} | ch.: {self.ch:1.3e}"
         )
