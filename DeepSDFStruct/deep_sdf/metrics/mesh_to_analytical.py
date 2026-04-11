@@ -11,7 +11,7 @@ def mesh_to_analytical(gt_sdf: SDFBase, gen_mesh: torchSurfMesh) -> float:
     Calculates the SDF for every vertex on the mesh
     """
 
-    return np.abs(gt_sdf.forward(gen_mesh.vertices)).mean()
+    return gt_sdf.forward(gen_mesh.vertices).abs().mean().item()
 
 
 def chamfer_distance(mesh_a, mesh_b, n_surface_samples: int = 10000) -> float:
