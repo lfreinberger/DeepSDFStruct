@@ -126,7 +126,14 @@ confidential*
 
 # slurm files
 slurm-*.out
-run_training.slrm
+*.slrm
 
 # intermediate model runs
 mlruns
+mlflow.db
+run_train_mlflow_single_run.py
+run_train_mlflow.py
+run_mlflow_reconstruction.py
+
+# development journal
+history.md
