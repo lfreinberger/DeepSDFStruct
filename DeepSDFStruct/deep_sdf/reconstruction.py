@@ -25,6 +25,10 @@ def reconstruct_from_samples(
     use_mlflow: bool = False,
     mlflow_metric_prefix: str = "reconstruction",
     mlflow_log_every_n_steps: int = 10,
+    code_reg_lambda: float = 0.0,
+    code_bound: float | None = None,
+    grad_clip: float | None = None,
+    eikonal_lambda: float = 0.0,
 ):
     if optimizer_name == "adam":
         optimizer = torch.optim.Adam(sdf.parameters(), lr=lr)
@@ -93,6 +97,10 @@ def reconstruct_from_samples(
         dataset, batch_size=batch_size, shuffle=True, drop_last=drop_last
     )
 
+    # Detect parametrization for regularization (e.g. LatticeSDFStruct)
+    _parametrization = getattr(sdf, "parametrization", None)
+    _has_bounds = hasattr(sdf, "_get_domain_bounds")
+
     loss_history = []
     for e in pbar:
         for querie_batch, gt_batch in dataloader:
@@ -100,15 +108,47 @@ def reconstruct_from_samples(
             def closure() -> torch.Tensor:
                 optimizer.zero_grad()
                 pred_dist = sdf(querie_batch)
-                loss = Loss(pred_dist, gt_batch)
-                loss.backward()
-                return loss
+                loss_total = Loss(pred_dist, gt_batch)
+
+                # L2 regularization on evaluated latent codes
+                if code_reg_lambda > 0 and _parametrization is not None and _has_bounds:
+                    bounds = sdf._get_domain_bounds()
+                    clamped = querie_batch.clamp(bounds[0], bounds[1])
+                    lat_codes = _parametrization(clamped)
+                    reg = lat_codes.pow(2).mean()
+                    loss_total = loss_total + code_reg_lambda * reg
+
+                # Eikonal regularization: ||grad SDF|| ~ 1 near surface
+                if eikonal_lambda > 0:
+                    near_mask = gt_batch.abs().squeeze() < 0.05
+                    if near_mask.any():
+                        xyz_eik = querie_batch[near_mask].detach().requires_grad_(True)
+                        pred_eik = sdf(xyz_eik)
+                        grad_sdf = torch.autograd.grad(
+                            pred_eik.sum(), xyz_eik, create_graph=True
+                        )[0]
+                        eikonal_loss = ((grad_sdf.norm(dim=-1) - 1) ** 2).mean()
+                        loss_total = loss_total + eikonal_lambda * eikonal_loss
+
+                loss_total.backward()
+                return loss_total
 
             if optimizer_name == "adam":
                 loss = closure()
+
+                if grad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(sdf.parameters(), grad_clip)
+
                 optimizer.step()
             elif optimizer_name == "lbfgs":
                 loss = optimizer.step(closure)
+
+            # Hard constraint on control point magnitudes
+            if code_bound is not None and _parametrization is not None:
+                with torch.no_grad():
+                    for p in _parametrization.parameters():
+                        p.clamp_(-code_bound, code_bound)
+
             loss_num = loss.detach().item()
             pbar.set_postfix({"loss": f"{loss_num:.5f}"})
             loss_history.append(loss_num)

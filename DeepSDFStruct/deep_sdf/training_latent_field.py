@@ -86,6 +86,20 @@ class WarmupLearningRateSchedule(LearningRateSchedule):
         return self.initial + (self.warmed_up - self.initial) * epoch / self.length
 
 
+class CosineAnnealingLRSchedule(LearningRateSchedule):
+    def __init__(self, initial, final, total_epochs):
+        self.initial = float(initial)
+        self.final = float(final)
+        self.total_epochs = int(total_epochs)
+
+    def get_learning_rate(self, epoch):
+        if epoch >= self.total_epochs:
+            return self.final
+        return self.final + 0.5 * (self.initial - self.final) * (
+            1 + math.cos(math.pi * epoch / self.total_epochs)
+        )
+
+
 def get_spec_with_default(specs, key, default):
     return specs[key] if key in specs else default
 
@@ -104,6 +118,10 @@ def _make_lr_schedule(sched_spec):
     if t == "warmup":
         return WarmupLearningRateSchedule(
             sched_spec["Initial"], sched_spec["WarmedUp"], sched_spec["Length"]
+        )
+    if t == "cosine":
+        return CosineAnnealingLRSchedule(
+            sched_spec["Initial"], sched_spec["Final"], sched_spec["TotalEpochs"]
         )
     raise ValueError(f"Unknown LR schedule type: {sched_spec}")
 
@@ -326,7 +344,7 @@ def train(
         level=logging.INFO,
         format="%(asctime)s %(message)s",
         datefmt="%H:%M:%S",
-        force=True,  # <-- IMPORTANT (Python 3.8+)
+        force=True,
     )
     logging.debug("running " + experiment_directory)
     experiment_directory = str(experiment_directory)
@@ -492,6 +510,19 @@ def train(
     code_reg_lambda = float(
         get_spec_with_default(specs, "CodeRegularizationLambda", 1e-4)
     )
+    code_reg_target = get_spec_with_default(
+        specs, "CodeRegularizationTarget", "evaluated"
+    )  # "control_points", "evaluated", or "both"
+
+    code_bound = get_spec_with_default(specs, "CodeBound", None)
+    if code_bound is not None:
+        code_bound = float(code_bound)
+
+    grad_clip = get_spec_with_default(specs, "GradientClipNorm", None)
+    if grad_clip is not None:
+        grad_clip = float(grad_clip)
+
+    eikonal_lambda = float(get_spec_with_default(specs, "EikonalLambda", 0.0))
 
     loss_type = get_spec_with_default(specs, "LossType", "ClampedL1")
     if loss_type.lower() == "clampedl1":
@@ -595,36 +626,53 @@ def train(
             param_group["lr"] = lr_schedules[i].get_learning_rate(epoch)
 
     start_epoch = 1
+    loss_log = []
+    lr_log = []
+    timing_log = []
+    lat_mag_log = []
+    param_mag_log = {}
+
     if continue_from is not None:
+        # Normalize checkpoint name: ws functions expect name without .pth,
+        # local save/load functions expect the full filename.
+        ckpt_filename = (
+            continue_from
+            if continue_from.endswith(".pth")
+            else continue_from + ".pth"
+        )
+        ckpt_label = ckpt_filename[:-4]
+
         try:
-            decoder = ws.load_model_parameters(
-                experiment_directory, continue_from, decoder, device=device
+            model_epoch = ws.load_model_parameters(
+                experiment_directory, ckpt_label, decoder, device=device
             )
-            model_epoch = ws.load_start_epoch(experiment_directory, continue_from)
         except Exception:
             model_epoch = 1
 
         try:
-            _ = load_optimizer(experiment_directory, continue_from, optimizer_all)
+            _ = load_optimizer(experiment_directory, ckpt_filename, optimizer_all)
         except Exception:
             pass
 
         try:
             _ = load_latent_fields(
-                experiment_directory, continue_from, latent_fields, device=device
+                experiment_directory, ckpt_filename, latent_fields, device=device
             )
         except Exception:
             pass
 
-        loss_log, lr_log, timing_log, lat_mag_log, param_mag_log, log_epoch = load_logs(
-            experiment_directory
-        )
+        try:
+            loss_log, lr_log, timing_log, lat_mag_log, param_mag_log, log_epoch = (
+                load_logs(experiment_directory)
+            )
+            if log_epoch != model_epoch:
+                loss_log, lr_log, timing_log, lat_mag_log, param_mag_log = clip_logs(
+                    loss_log, lr_log, timing_log, lat_mag_log, param_mag_log, model_epoch
+                )
+        except Exception:
+            logging.warning("Could not load logs, starting fresh log history.")
 
         start_epoch = model_epoch + 1
-        if log_epoch != model_epoch:
-            loss_log, lr_log, timing_log, lat_mag_log, param_mag_log = clip_logs(
-                loss_log, lr_log, timing_log, lat_mag_log, param_mag_log, model_epoch
-            )
 
     def signal_handler(sig, frame):
         logging.info("Stopping early...")
@@ -636,14 +684,10 @@ def train(
     decoder.train()
     latent_fields.train()
 
-    loss_log = []
-    lr_log = []
-    timing_log = []
-    lat_mag_log = []
-    param_mag_log = {}
-
     start_train = time.time()
     global_step = 0
+    error = 0.0
+    total_time = "0:00:00"
     for epoch in range(start_epoch, num_epochs + 1):
         start = time.time()
         adjust_learning_rate(epoch)
@@ -684,12 +728,14 @@ def train(
 
                 # compute predictions per scene id (supports ScenesPerBatch > 1)
                 pred = torch.zeros_like(sdf_i)
+                mask_cache = {}
 
                 # IMPORTANT: struct internally
                 #   xyz -> normalize by bounds -> spline -> microtile._set_param -> decode
                 for sid in idx_i.unique():
                     sid_int = int(sid.item())
                     mask = idx_i == sid
+                    mask_cache[sid_int] = mask
                     pred[mask] = structs[sid_int](xyz_i[mask])
 
                 if enforce_minmax:
@@ -697,33 +743,63 @@ def train(
 
                 loss = loss_fn(pred, sdf_i)
 
-                # L2 regularization on *used* latent fields' parameters (control points)
-                # reg = 0.0
-                # for sid in idx_i.unique():
-                #     sid_int = int(sid.item())
-                #     for p in latent_fields[sid_int].parameters():
-                #         reg = reg + (p**2).mean()
-                # loss_total = loss + code_reg_lambda * reg
-
+                # L2 regularization on latent codes
                 reg = 0.0
-                count = 0
+                n_reg_terms = 0
                 for sid in idx_i.unique():
-                    for p in latent_fields[sid].parameters():
-                        reg = reg + p.pow(2).mean()
-                        count += 1
+                    sid_int = int(sid.item())
+                    if code_reg_target in ("evaluated", "both"):
+                        # Regularize actual latent codes at query positions
+                        # (what the decoder sees)
+                        samples_clamped = xyz_i[mask_cache[sid_int]].clamp(
+                            bounds_param_space[0], bounds_param_space[1]
+                        )
+                        lat_codes = latent_fields[sid_int](samples_clamped)
+                        reg = reg + lat_codes.pow(2).mean()
+                        n_reg_terms += 1
+                    if code_reg_target in ("control_points", "both"):
+                        # Regularize raw spline control points
+                        for p in latent_fields[sid_int].parameters():
+                            reg = reg + p.pow(2).mean()
+                            n_reg_terms += 1
 
-                reg = reg / max(
-                    count, 1
-                )  # normalize so it doesn't depend on how many params you loop
+                reg = reg / max(n_reg_terms, 1)
                 warmup = min(1.0, epoch / 100.0)
                 loss_total = loss + code_reg_lambda * warmup * reg
+
+                # Eikonal regularization: enforce ||grad SDF|| ~ 1 near surface
+                if eikonal_lambda > 0:
+                    near_mask = sdf_i.abs().squeeze() < clamp_dist * 0.5
+                    if near_mask.any():
+                        xyz_eik = xyz_i[near_mask].detach().clone().requires_grad_(True)
+                        # Pick one scene for Eikonal (first unique sid in chunk)
+                        eik_sid = int(idx_i[near_mask][0].item())
+                        pred_eik = structs[eik_sid](xyz_eik)
+                        grad_sdf = torch.autograd.grad(
+                            pred_eik.sum(),
+                            xyz_eik,
+                            create_graph=True,
+                        )[0]
+                        eikonal_loss = ((grad_sdf.norm(dim=-1) - 1) ** 2).mean()
+                        loss_total = loss_total + eikonal_lambda * eikonal_loss
 
                 loss_total.backward()
 
                 batch_loss += float(loss.detach().item())
                 batch_reg += float(reg.detach().item())
 
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(decoder.parameters(), grad_clip)
+                torch.nn.utils.clip_grad_norm_(latent_fields.parameters(), grad_clip)
+
             optimizer_all.step()
+
+            if code_bound is not None:
+                with torch.no_grad():
+                    for lf in latent_fields:
+                        for p in lf.parameters():
+                            p.clamp_(-code_bound, code_bound)
+
             epoch_error += batch_loss
             if use_mlflow and (global_step % mlflow_log_every_n_batches == 0):
                 # log batch-level metrics
@@ -732,10 +808,6 @@ def train(
                     step=global_step,
                 )
             global_step += 1
-
-            end = time.time()
-            seconds_elapsed = end - start
-            timing_log.append(seconds_elapsed)
 
             loss_log.append(float(batch_loss))
 
@@ -766,7 +838,7 @@ def train(
                 f"({avg_time_per_epoch:.2f}s/epoch)"
             )
 
-        timing_log.append(seconds_elapsed)
+        timing_log.append(time.time() - start)
 
         lr_log.append(
             [lr_schedules[i].get_learning_rate(epoch) for i in range(len(lr_schedules))]
@@ -974,3 +1046,9 @@ def export_training_latent_fields_to_stl(
 
         export_surface_mesh(out_path, surf_mesh.to_gus(), derivative)
         print(f"[ok] {out_path}")
+
+
+if __name__ == "__main__":
+    experiment_dir = "confidential/primitives_latent_improved_2"
+    #train(experiment_dir)
+    export_training_latent_fields_to_stl(experiment_dir, checkpoint="latest.pth")

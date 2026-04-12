@@ -12,7 +12,7 @@ def save_error_vtp(points, error, filename, array_name="sdf_error"):
 
 
 def find_scalar_array(mesh):
-    preferred_names = ["sdf", "distance", "distances", "signed_distance"]
+    preferred_names = ["SDF", "sdf", "distance", "distances", "signed_distance"]
 
     for name in preferred_names:
         if name in mesh.point_data:

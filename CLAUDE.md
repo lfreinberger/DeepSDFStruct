@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 DeepSDFStruct is a differentiable framework for designing and deforming 3D microstructured materials using Signed Distance Functions (SDFs), spline-based lattice structures, and neural shape encoding (DeepSDF). It targets topology optimization, additive manufacturing, and metamaterial research.
 
+This is a fork (`lfreinberger/DeepSDFStruct`) of the upstream repo (`mkofler96/DeepSDFStruct`). The `upstream` remote tracks the original.
+
 ## Commands
 
 ### Setup and Install
@@ -15,6 +17,9 @@ uv sync
 
 # Or with pip
 pip install -e .
+
+# Set up pre-commit hooks (runs black on commit)
+pre-commit install
 ```
 
 ### Running Tests
@@ -31,9 +36,10 @@ uv run pytest tests/test_sdf_functions.py::test_name
 
 ### Code Formatting
 ```bash
-# Format with black (pre-commit hook)
+# Format with black (also enforced by pre-commit hook)
 black DeepSDFStruct/ tests/
 ```
+**Note:** Black is configured with `skip-magic-trailing-comma = true` in `pyproject.toml`.
 
 ### Building Docs
 ```bash
@@ -43,7 +49,7 @@ uv run make -C docs html
 ```
 
 ### CI
-Tests run on Python 3.10–3.13 via GitHub Actions. Coverage is reported to Coveralls.
+Tests run on Python 3.10–3.13 via GitHub Actions. Coverage is reported to Coveralls. Test artifacts are written to `tests/tmp_outputs/` (created automatically by `conftest.py`).
 
 ## Architecture
 
@@ -111,3 +117,13 @@ MLflow is used for tracking training runs. The local `mlflow.db` SQLite database
 
 ### Knot Vectors / Parametrization
 Knot vectors are defined on the actual normalized domain (not a shifted/scaled version). See commit `be19b52` for context on this convention.
+
+### Dependencies
+Two key dependencies come from custom git forks (configured in `pyproject.toml` under `[tool.uv.sources]` and `dependencies`):
+- `splinepy` — from `tataratat/splinepy.git` (head of main)
+- `gustaf` — from `mkofler96/gustaf.git` branch `ft-mfem-3D-export`
+
+If dependency resolution fails, check these git sources first.
+
+### Versioning
+Uses `setuptools-scm` — the package version is derived from git tags, not a hardcoded string.
