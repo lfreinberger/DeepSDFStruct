@@ -126,11 +126,52 @@ def export_control_lattice_paramspace(
     print(f"Control lattice exported to: {filename}")
 
 
+def export_design_volume_paramspace(spline, filename="design_volume_paramspace.vts"):
+    """Export the parametric design volume as a pyvista StructuredGrid
+    (.vts). Points are placed at every unique knot intersection, so the
+    volume shows the knot subdivision structure. Natural companion to
+    `export_knot_grid_paramspace` (wireframe) and
+    `export_control_lattice_paramspace` (Greville points) when you want
+    a solid, colorable volume in ParaView.
+
+    Parameters
+    ----------
+    spline : splinepy.BSpline
+    filename : str or Path
+        Output .vts file path.
+    """
+    kvs = [np.unique(np.asarray(kv, dtype=float)) for kv in spline.knot_vectors]
+    u, v, w = kvs
+    nu, nv, nw = len(u), len(v), len(w)
+    N = nu * nv * nw
+
+    U, V, W = np.meshgrid(u, v, w, indexing="ij")
+    grid = pv.StructuredGrid(U, V, W)
+
+    ids = np.arange(N)
+    I, J, K = np.unravel_index(ids, (nu, nv, nw), order="F")
+    on_boundary = (
+        (I == 0) | (I == nu - 1)
+        | (J == 0) | (J == nv - 1)
+        | (K == 0) | (K == nw - 1)
+    ).astype(np.int32)
+
+    grid["id"] = ids
+    grid["i"] = I
+    grid["j"] = J
+    grid["k"] = K
+    grid["on_boundary"] = on_boundary
+
+    grid.save(str(filename))
+    print(f"Design volume (paramspace) exported to: {filename}")
+
+
 def export_control_lattice_physical(
     control_points,
     n_per_dim,
     filename,
     order="F",
+    boundary_only=False,
 ):
     """Export a deformed control lattice in physical space: points plus
     lines connecting (i,j,k) neighbors along each grid axis.
@@ -145,6 +186,10 @@ def export_control_lattice_physical(
         Output .vtp file path.
     order : str
         Flattening order for control point indices ('F' or 'C').
+    boundary_only : bool
+        If True, keep only the points and edges on the six outer faces
+        of the lattice (the "boundary cage"). Point indices are remapped
+        so `id` still refers to the original full-lattice index.
     """
     if isinstance(control_points, torch.Tensor):
         pts = control_points.detach().cpu().numpy()
@@ -164,49 +209,155 @@ def export_control_lattice_physical(
     def flat(i, j, k):
         return np.ravel_multi_index((i, j, k), (n0, n1, n2), order=order)
 
-    edges = []
-    # +i edges
-    if n0 > 1:
-        i_idx, j_idx, k_idx = np.meshgrid(
-            np.arange(n0 - 1), np.arange(n1), np.arange(n2), indexing="ij",
-        )
+    def _edge_block(i_range, j_range, k_range, di, dj, dk):
+        i_idx, j_idx, k_idx = np.meshgrid(i_range, j_range, k_range, indexing="ij")
         a = flat(i_idx.ravel(), j_idx.ravel(), k_idx.ravel())
-        b = flat(i_idx.ravel() + 1, j_idx.ravel(), k_idx.ravel())
-        edges.append(np.column_stack([a, b]))
-    # +j edges
-    if n1 > 1:
-        i_idx, j_idx, k_idx = np.meshgrid(
-            np.arange(n0), np.arange(n1 - 1), np.arange(n2), indexing="ij",
-        )
-        a = flat(i_idx.ravel(), j_idx.ravel(), k_idx.ravel())
-        b = flat(i_idx.ravel(), j_idx.ravel() + 1, k_idx.ravel())
-        edges.append(np.column_stack([a, b]))
-    # +k edges
-    if n2 > 1:
-        i_idx, j_idx, k_idx = np.meshgrid(
-            np.arange(n0), np.arange(n1), np.arange(n2 - 1), indexing="ij",
-        )
-        a = flat(i_idx.ravel(), j_idx.ravel(), k_idx.ravel())
-        b = flat(i_idx.ravel(), j_idx.ravel(), k_idx.ravel() + 1)
-        edges.append(np.column_stack([a, b]))
+        b = flat(i_idx.ravel() + di, j_idx.ravel() + dj, k_idx.ravel() + dk)
+        return np.column_stack([a, b]), i_idx.ravel(), j_idx.ravel(), k_idx.ravel()
 
-    if edges:
-        edge_array = np.vstack(edges)
+    edges = []
+    # +i edges: shared j, k → on boundary iff j or k on boundary
+    if n0 > 1:
+        edge, _, j_ed, k_ed = _edge_block(
+            np.arange(n0 - 1), np.arange(n1), np.arange(n2), 1, 0, 0,
+        )
+        if boundary_only:
+            mask = (j_ed == 0) | (j_ed == n1 - 1) | (k_ed == 0) | (k_ed == n2 - 1)
+            edge = edge[mask]
+        edges.append(edge)
+    # +j edges: shared i, k → on boundary iff i or k on boundary
+    if n1 > 1:
+        edge, i_ed, _, k_ed = _edge_block(
+            np.arange(n0), np.arange(n1 - 1), np.arange(n2), 0, 1, 0,
+        )
+        if boundary_only:
+            mask = (i_ed == 0) | (i_ed == n0 - 1) | (k_ed == 0) | (k_ed == n2 - 1)
+            edge = edge[mask]
+        edges.append(edge)
+    # +k edges: shared i, j → on boundary iff i or j on boundary
+    if n2 > 1:
+        edge, i_ed, j_ed, _ = _edge_block(
+            np.arange(n0), np.arange(n1), np.arange(n2 - 1), 0, 0, 1,
+        )
+        if boundary_only:
+            mask = (i_ed == 0) | (i_ed == n0 - 1) | (j_ed == 0) | (j_ed == n1 - 1)
+            edge = edge[mask]
+        edges.append(edge)
+
+    edge_array = np.vstack(edges) if edges else np.zeros((0, 2), dtype=np.int64)
+
+    if boundary_only:
+        on_boundary = (
+            (I == 0) | (I == n0 - 1)
+            | (J == 0) | (J == n1 - 1)
+            | (K == 0) | (K == n2 - 1)
+        )
+        keep_idx = np.flatnonzero(on_boundary)
+        remap = -np.ones(N, dtype=np.int64)
+        remap[keep_idx] = np.arange(keep_idx.size)
+        pts_out = pts[keep_idx]
+        ids_out = ids[keep_idx]
+        I_out, J_out, K_out = I[keep_idx], J[keep_idx], K[keep_idx]
+        edge_array = remap[edge_array]
+    else:
+        pts_out = pts
+        ids_out = ids
+        I_out, J_out, K_out = I, J, K
+
+    if edge_array.size > 0:
         lines = np.column_stack(
             [np.full(edge_array.shape[0], 2, dtype=np.int64), edge_array]
         ).ravel()
     else:
         lines = np.array([], dtype=np.int64)
 
-    poly = pv.PolyData(pts)
+    poly = pv.PolyData(pts_out)
     if lines.size > 0:
         poly.lines = lines
-    poly["id"] = ids
-    poly["i"] = I
-    poly["j"] = J
-    poly["k"] = K
+    poly["id"] = ids_out
+    poly["i"] = I_out
+    poly["j"] = J_out
+    poly["k"] = K_out
     poly.save(str(filename))
     print(f"Control lattice (physical) exported to: {filename}")
+
+
+def export_control_volume_physical(
+    control_points,
+    n_per_dim,
+    filename,
+    undeformed=None,
+    order="F",
+):
+    """Export a deformed control lattice as a StructuredGrid (.vts) — a
+    solid hexahedral volume. In ParaView, render directly (adjust opacity)
+    or apply `Extract Surface` to see only the six boundary faces. Color
+    by any point array; `displacement_mag` is a natural choice.
+
+    Parameters
+    ----------
+    control_points : torch.Tensor or np.ndarray
+        Shape (N, 3) where N == prod(n_per_dim). Ordering must be F-order
+        (i varies fastest), matching VTK's StructuredGrid convention.
+    n_per_dim : sequence of 3 ints
+        (n0, n1, n2) grid shape of the control lattice.
+    filename : str or Path
+        Output .vts file path.
+    undeformed : torch.Tensor or np.ndarray, optional
+        Same shape as `control_points`. If provided, adds `displacement`
+        (vector) and `displacement_mag` (scalar) point arrays.
+    order : str
+        Flattening order ('F' required — VTK StructuredGrid uses F-order).
+    """
+    if order != "F":
+        raise NotImplementedError(
+            "StructuredGrid requires order='F' (i varies fastest)."
+        )
+    if isinstance(control_points, torch.Tensor):
+        pts = control_points.detach().cpu().numpy()
+    else:
+        pts = np.asarray(control_points)
+
+    n0, n1, n2 = (int(n) for n in n_per_dim)
+    N = n0 * n1 * n2
+    if pts.shape[0] != N:
+        raise ValueError(
+            f"control_points has {pts.shape[0]} rows but n_per_dim={n_per_dim} implies {N}"
+        )
+
+    grid = pv.StructuredGrid()
+    grid.points = pts.astype(np.float64, copy=False)
+    grid.dimensions = (n0, n1, n2)
+
+    ids = np.arange(N)
+    I, J, K = np.unravel_index(ids, (n0, n1, n2), order=order)
+    on_boundary = (
+        (I == 0) | (I == n0 - 1)
+        | (J == 0) | (J == n1 - 1)
+        | (K == 0) | (K == n2 - 1)
+    ).astype(np.int32)
+
+    grid["id"] = ids
+    grid["i"] = I
+    grid["j"] = J
+    grid["k"] = K
+    grid["on_boundary"] = on_boundary
+
+    if undeformed is not None:
+        if isinstance(undeformed, torch.Tensor):
+            und = undeformed.detach().cpu().numpy()
+        else:
+            und = np.asarray(undeformed)
+        if und.shape != pts.shape:
+            raise ValueError(
+                f"undeformed shape {und.shape} does not match control_points {pts.shape}"
+            )
+        disp = pts - und
+        grid["displacement"] = disp
+        grid["displacement_mag"] = np.linalg.norm(disp, axis=1)
+
+    grid.save(str(filename))
+    print(f"Control volume (physical) exported to: {filename}")
 
 
 def export_control_points(control_points, file_path):

@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+title: "DeepSDFStruct"
+version: "1.0.0-paper"
+type: software
+message: "If you use this software, please cite the archived release."
+abstract: "Differentiable signed-distance-function and spline-lattice tooling used by DeepShapeOpt."
+authors:
+  - given-names: Michael
+    family-names: Kofler
+    affiliation: "TU Wien"
+  - given-names: Lukas
+    family-names: Freinberger
+    affiliation: "TU Wien"
+license: Apache-2.0
+repository-code: "https://github.com/lfreinberger/DeepSDFStruct"
+keywords:
+  - signed distance functions
+  - neural implicit representation
+  - spline lattices
+  - geometry optimization

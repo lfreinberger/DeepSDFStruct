@@ -663,6 +663,7 @@ def create_3D_mesh(
     diffmode="fwd",
     deformation_function: None | TorchSpline | TorchScaling = None,
     use_tiling=True,
+    extend_bounds=True,
 ) -> Tuple[Union[torchSurfMesh, torchVolumeMesh], Optional[_torch.Tensor]]:
     """Generate a 3D mesh from an SDF using FlexiCubes dual contouring.
 
@@ -694,6 +695,9 @@ def create_3D_mesh(
     bounds : array-like of shape (2, 3), optional
         Spatial bounds [[xmin, ymin, zmin], [xmax, ymax, zmax]].
         If None, uses the SDF's domain bounds.
+    sdf_batch_size : int or None, default None
+        If set, evaluates the SDF in batches of this size to reduce peak
+        GPU memory usage. Only applies when ``differentiate=False``.
 
     Returns
     -------
@@ -751,9 +755,10 @@ def create_3D_mesh(
     if bounds is None:
         bounds = sdf._get_domain_bounds()
     extended_bounds = bounds.clone()
-    off = (extended_bounds[1] - extended_bounds[0]) * 0.05
-    extended_bounds[0] -= off
-    extended_bounds[1] += off
+    if extend_bounds:
+        off = (extended_bounds[1] - extended_bounds[0]) * 0.05
+        extended_bounds[0] -= off
+        extended_bounds[1] += off
 
     N = process_N_base_input(N_base, tiling)
 
