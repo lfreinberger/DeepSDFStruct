@@ -33,6 +33,13 @@ env.bak/
 venv.bak/
 .python-version
 
+# Local environment and machine-specific settings
+.env
+.env.*
+!.env.example
+.claude/
+.cursor/
+
 # PyInstaller
 *.manifest
 *.spec
@@ -123,6 +130,14 @@ todo
 
 # confidential files
 confidential*
+private*
+secrets*
+*secret*
+*token*
+*.pem
+*.key
+*.p12
+*.pfx
 
 # slurm files
 slurm-*.out

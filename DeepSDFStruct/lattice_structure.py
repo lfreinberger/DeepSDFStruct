@@ -220,10 +220,10 @@ class LatticeSDFStruct(_SDFBase):
         outside_dist = _torch.max(
             _torch.max(lower_dist, dim=-1).values, _torch.max(upper_dist, dim=-1).values
         ).unsqueeze(-1)
-        if (outside_dist > 0).any():
-            logger.warning(
-                "Some samples are outside the domain bounds. SDF values for these points will be positive and represent distance to the boundary."
-            )
+        # if (outside_dist > 0).any():
+        #     logger.warning(
+        #         "Some samples are outside the domain bounds. SDF values for these points will be positive and represent distance to the boundary."
+        #     )
 
         sdf_values = outside_dist
         sdf_values[inside_idx] = inside_sdf
