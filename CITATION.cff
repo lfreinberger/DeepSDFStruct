@@ -13,8 +13,22 @@ authors:
     affiliation: "TU Wien"
 license: Apache-2.0
 repository-code: "https://github.com/lfreinberger/DeepSDFStruct"
+doi: 10.5281/zenodo.20205817
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.20205817
+    description: "Archived release of the source code"
 keywords:
   - signed distance functions
   - neural implicit representation
   - spline lattices
   - geometry optimization
+# TODO: add `preferred-citation:` pointing at the companion paper once published.
+references:
+  - type: data
+    title: "Training data for DeepSDFStruct neural decoder"
+    authors:
+      - given-names: Lukas
+        family-names: Freinberger
+        affiliation: "TU Wien"
+    doi: 10.48436/12y18-j6236
