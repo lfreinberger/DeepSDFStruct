@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 title: "DeepSDFStruct"
-version: "1.0.0-paper"
+version: "0.1.0"
 type: software
 message: "If you use this software, please cite the archived release."
 abstract: "Differentiable signed-distance-function and spline-lattice tooling used by DeepShapeOpt."
