@@ -1,7 +1,7 @@
 {
-    "Description": "DeepLS latent-field trained on 100 primitive shapes (CodeLength 32)",
+    "Description": "DeepLS latent-field trained on analytically-generated primitive shapes (CodeLength 32)",
     "DataSource": "/Users/lukas/projects/projectsPhd/TrainingData",
-    "TrainSplit": "splits/primitives_cl32_new_train.json",
+    "TrainSplit": "splits/primitives_train.json",
     "TestSplit": "",
     "NetworkArch": "deep_sdf_decoder",
     "NetworkSpecs": {
