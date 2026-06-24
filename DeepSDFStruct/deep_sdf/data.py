@@ -64,10 +64,22 @@ def remove_nans(tensor, geom_dimension):
     return tensor[~tensor_nan, :].float()
 
 
+def _read_pos_neg(npz):
+    """Read positive/negative SDF samples from an npz archive.
+
+    Supports both the 'pos'/'neg' key convention (e.g. ``np.savez(f, pos=..,
+    neg=..)``) and the legacy 'pos.npy'/'neg.npy' keys.
+    """
+    pos_key = "pos" if "pos" in npz else "pos.npy"
+    neg_key = "neg" if "neg" in npz else "neg.npy"
+    return npz[pos_key], npz[neg_key]
+
+
 def read_sdf_samples_into_ram(filename):
     npz = np.load(filename)
-    pos_tensor = torch.from_numpy(npz["pos.npy"]).float()
-    neg_tensor = torch.from_numpy(npz["neg.npy"]).float()
+    pos, neg = _read_pos_neg(npz)
+    pos_tensor = torch.from_numpy(pos).float()
+    neg_tensor = torch.from_numpy(neg).float()
 
     return [pos_tensor, neg_tensor]
 
@@ -75,8 +87,9 @@ def read_sdf_samples_into_ram(filename):
 def unpack_sdf_samples(filename, geom_dimension, subsample=None):
     npz = np.load(filename)
 
-    pos_tensor = remove_nans(torch.from_numpy(npz["pos.npy"]), geom_dimension)
-    neg_tensor = remove_nans(torch.from_numpy(npz["neg.npy"]), geom_dimension)
+    pos, neg = _read_pos_neg(npz)
+    pos_tensor = remove_nans(torch.from_numpy(pos), geom_dimension)
+    neg_tensor = remove_nans(torch.from_numpy(neg), geom_dimension)
 
     if subsample is None:
         return torch.cat([pos_tensor, neg_tensor], 0)
@@ -152,6 +165,7 @@ class SDFSamples(torch.utils.data.Dataset):
         load_ram=False,
         print_filename=False,
         num_files=1000000,
+        held_out_fraction=0.0,
     ):
         self.subsample = subsample
         self.geom_dimension = geom_dimension
@@ -167,29 +181,55 @@ class SDFSamples(torch.utils.data.Dataset):
 
         self.load_ram = load_ram
 
+        if not (0.0 <= held_out_fraction < 1.0):
+            raise ValueError(
+                f"held_out_fraction must be in [0, 1), got {held_out_fraction}"
+            )
+        self.held_out_fraction = float(held_out_fraction)
+        # Per-scene held-out points for validation. Each entry is [pos, neg].
+        # Only populated when held_out_fraction > 0 and load_ram is True.
+        self.val_data = []
+
         self.loaded_mat_properties = []
         if load_ram:
             self.loaded_data = []
             for f in self.npyfiles:
                 filename = os.path.join(self.data_source, ws.sdf_samples_subdir, f)
                 npz = np.load(filename)
+                pos, neg = _read_pos_neg(npz)
                 pos_tensor = remove_nans(
-                    torch.from_numpy(npz["pos.npy"]), self.geom_dimension
+                    torch.from_numpy(pos), self.geom_dimension
                 )
                 neg_tensor = remove_nans(
-                    torch.from_numpy(npz["neg.npy"]), self.geom_dimension
+                    torch.from_numpy(neg), self.geom_dimension
                 )
-                self.loaded_data.append(
-                    [
-                        pos_tensor[torch.randperm(pos_tensor.shape[0])],
-                        neg_tensor[torch.randperm(neg_tensor.shape[0])],
-                    ]
-                )
+                # shuffle so the held-out slice is a random subset
+                pos_tensor = pos_tensor[torch.randperm(pos_tensor.shape[0])]
+                neg_tensor = neg_tensor[torch.randperm(neg_tensor.shape[0])]
+
+                if self.held_out_fraction > 0.0:
+                    n_pos_val = int(round(pos_tensor.shape[0] * self.held_out_fraction))
+                    n_neg_val = int(round(neg_tensor.shape[0] * self.held_out_fraction))
+                    # keep at least one training point per sign if possible
+                    n_pos_val = min(n_pos_val, max(pos_tensor.shape[0] - 1, 0))
+                    n_neg_val = min(n_neg_val, max(neg_tensor.shape[0] - 1, 0))
+                    pos_val = pos_tensor[:n_pos_val]
+                    neg_val = neg_tensor[:n_neg_val]
+                    pos_tensor = pos_tensor[n_pos_val:]
+                    neg_tensor = neg_tensor[n_neg_val:]
+                    self.val_data.append([pos_val, neg_val])
+
+                self.loaded_data.append([pos_tensor, neg_tensor])
                 if "E" in npz.keys():
                     self.loaded_mat_properties.append(
                         torch.from_numpy(npz["E.npy"]).to(torch.float32)
                     )
                 self.filenames.append(filename)
+        elif self.held_out_fraction > 0.0:
+            raise ValueError(
+                "held_out_fraction > 0 requires load_ram=True so the validation "
+                "split can be reserved from the in-memory samples."
+            )
 
     def __len__(self):
         return len(self.npyfiles)
