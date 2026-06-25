@@ -29,6 +29,7 @@ def reconstruct_from_samples(
     code_bound: float | None = None,
     grad_clip: float | None = None,
     eikonal_lambda: float = 0.0,
+    step_callback=None,
 ):
     if optimizer_name == "adam":
         optimizer = torch.optim.Adam(sdf.parameters(), lr=lr)
@@ -96,6 +97,7 @@ def reconstruct_from_samples(
     dataloader = DataLoader(
         dataset, batch_size=batch_size, shuffle=True, drop_last=drop_last
     )
+    n_batches = len(dataloader)
 
     # Detect parametrization for regularization (e.g. LatticeSDFStruct)
     _parametrization = getattr(sdf, "parametrization", None)
@@ -103,7 +105,7 @@ def reconstruct_from_samples(
 
     loss_history = []
     for e in pbar:
-        for querie_batch, gt_batch in dataloader:
+        for batch_idx, (querie_batch, gt_batch) in enumerate(dataloader):
 
             def closure() -> torch.Tensor:
                 optimizer.zero_grad()
@@ -152,6 +154,9 @@ def reconstruct_from_samples(
             loss_num = loss.detach().item()
             pbar.set_postfix({"loss": f"{loss_num:.5f}"})
             loss_history.append(loss_num)
+
+            if step_callback is not None:
+                step_callback(e, batch_idx, n_batches)
 
     if loss_plot_path is not None:
         plot_reconstruction_loss(
