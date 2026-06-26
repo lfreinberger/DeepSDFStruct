@@ -332,16 +332,16 @@ def generate_primitive_dataset(cfg: dict) -> dict:
 
 CONFIG = {
     "data_source": "/Users/lukas/projects/projectsPhd/TrainingData",  # DataSource root
-    "dataset_name": "2026_06_24_primitive_shapes",
+    "dataset_name": "2026_06_25_primitive_shapes_4",
     "class_name": "shapes",
-    "split_name": "primitives_train.json",  # written under <data_source>/splits/
-    "num_scenes": 100,  # paper N=100
+    "split_name": "primitives_train_4.json",  # written under <data_source>/splits/
+    "num_scenes": 4,  # paper N=100
     "primitives_per_scene": 10,  # paper 10
     "primitive_types": ["sphere", "box", "cylinder"],
     "bounds": [[-1, -1, -1], [1, 1, 1]],  # Omega_box
     "n_uniform": 100_000,  # uniform samples / scene
     "n_surface_per_std": 500_000,  # x len(stds) => 1,000,000 near-surface
-    "stds": [0.025, 0.001],  # paper sigma1, sigma2
+    "stds": [0.005, 0.0001],  # paper sigma1, sigma2
     "scale_range": [0.1, 0.5],  # characteristic half-size of primitives
     "random_rotation": True,
     "seed": 42,

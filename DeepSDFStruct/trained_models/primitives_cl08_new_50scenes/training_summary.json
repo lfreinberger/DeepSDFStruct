@@ -1,0 +1,10 @@
+{
+    "loss": 0.002051277522696182,
+    "num_epochs": 10000,
+    "timestamp": "2026-06-25 20:32:42",
+    "host_name": "MacBook-Pro-von-Lukas-2.local",
+    "device": "cpu",
+    "training_duration": "0:09:10",
+    "data_dir": "/Users/lukas/projects/projectsPhd/TrainingData",
+    "version": "0.1.1.dev4+g8ce053484.d20260624"
+}

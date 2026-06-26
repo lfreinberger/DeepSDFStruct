@@ -1172,6 +1172,6 @@ def export_training_latent_fields_to_stl(
 
 
 if __name__ == "__main__":
-    experiment_dir = "confidential/primitives_latent_improved_2"
-    #train(experiment_dir)
-    export_training_latent_fields_to_stl(experiment_dir, checkpoint="latest.pth")
+    experiment_dir = "DeepSDFStruct/trained_models/primitives_cl16_new"
+    train(experiment_dir)
+    #export_training_latent_fields_to_stl(experiment_dir, checkpoint="latest.pth")
