@@ -1045,10 +1045,10 @@ def export_training_latent_fields_to_stl(
     experiment_directory: str,
     checkpoint: str = "latest.pth",
     out_dir: str | None = None,
-    N_base: int = 32,
+    N_base: int = 12,
     device: str | None = None,
-    overwrite: bool = False,
-    max_scenes: int | None = None,
+    overwrite: bool = True,
+    max_scenes: int = 3,
 ):
     """
     Export one STL per training scene using the *trained spline latent fields* (control points),
@@ -1172,6 +1172,6 @@ def export_training_latent_fields_to_stl(
 
 
 if __name__ == "__main__":
-    experiment_dir = "confidential/primitives_latent_improved_2"
-    #train(experiment_dir)
+    experiment_dir = "DeepSDFStruct/trained_models/primitives_cl35_new"
+    train(experiment_dir)
     export_training_latent_fields_to_stl(experiment_dir, checkpoint="latest.pth")
