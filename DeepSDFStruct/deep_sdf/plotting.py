@@ -2,6 +2,7 @@ import numpy as np
 import os
 import logging
 import torch
+import pandas as pd
 import matplotlib.pyplot as plt
 
 import DeepSDFStruct.deep_sdf.workspace as ws
@@ -72,13 +73,6 @@ def plot_logs(experiment_directory, show_lr=False, ax=None, filename=None):
 
     ax[0].set(xlabel="Epoch", ylabel="Loss")
 
-    # Overlay held-out validation loss (list of [epoch, val_loss] pairs), if present
-    val_log = logs.get("validation", [])
-    if val_log:
-        val = np.asarray(val_log, dtype=float)
-        ax[0].plot(val[:, 0], val[:, 1], "-o", color="#e8702a",
-                   markersize=3, linewidth=1, label="Validation Loss")
-
     ax[0].legend()
 
     if show_lr:
@@ -98,12 +92,6 @@ def plot_logs(experiment_directory, show_lr=False, ax=None, filename=None):
         plt.savefig(filename, bbox_inches="tight")
     elif show_plt:
         plt.show()
-
-
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import logging
 
 
 def plot_reconstruction_loss(

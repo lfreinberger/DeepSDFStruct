@@ -4,10 +4,9 @@ Primitive-Scene Training Data Generator
 =======================================
 
 Generates training scenes of simple geometric primitives (spheres, boxes,
-cylinders) randomly positioned, oriented, and scaled inside a bounding box, as
-described in the paper (Section 2.1.3, Figure 4, Table 1). The ground-truth SDF
-is computed *analytically* by combining the primitive SDFs with the minimum
-operation (``UnionSDF``).
+cylinders) randomly positioned, oriented, and scaled inside a bounding box. The
+ground-truth SDF is computed *analytically* by combining the primitive SDFs with
+the minimum operation (``UnionSDF``).
 
 For each scene the SDF is sampled in two complementary ways:
   - uniformly in the volume (``random_sample_sdf``), and

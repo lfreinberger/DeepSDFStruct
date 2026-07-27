@@ -184,7 +184,6 @@ def save_logs(
     lat_mag_log,
     param_mag_log,
     epoch,
-    val_log=None,
 ):
 
     torch.save(
@@ -195,7 +194,6 @@ def save_logs(
             "timing": timing_log,
             "latent_magnitude": lat_mag_log,
             "param_magnitude": param_mag_log,
-            "validation": val_log if val_log is not None else [],
         },
         os.path.join(experiment_directory, ws.logs_filename),
     )
@@ -221,12 +219,11 @@ def load_logs(experiment_directory):
         data["timing"],
         data["latent_magnitude"],
         data["param_magnitude"],
-        data.get("validation", []),
         data["epoch"],
     )
 
 
-def clip_logs(loss_log, lr_log, timing_log, lat_mag_log, param_mag_log, val_log, epoch):
+def clip_logs(loss_log, lr_log, timing_log, lat_mag_log, param_mag_log, epoch):
 
     iters_per_epoch = len(loss_log) // len(lr_log)
 
@@ -236,10 +233,8 @@ def clip_logs(loss_log, lr_log, timing_log, lat_mag_log, param_mag_log, val_log,
     lat_mag_log = lat_mag_log[:epoch]
     for n in param_mag_log:
         param_mag_log[n] = param_mag_log[n][:epoch]
-    # val_log entries are [epoch, value] pairs; keep those at or before `epoch`
-    val_log = [e for e in val_log if e[0] <= epoch]
 
-    return (loss_log, lr_log, timing_log, lat_mag_log, param_mag_log, val_log)
+    return (loss_log, lr_log, timing_log, lat_mag_log, param_mag_log)
 
 
 def load_optimizer(experiment_directory, filename, optimizer):
@@ -445,21 +440,6 @@ def train(
 
     log_frequency = get_spec_with_default(specs, "LogFrequency", 10)
 
-    # Point-level validation: hold out a fraction of each scene's samples and
-    # periodically evaluate reconstruction loss on those unseen points using the
-    # trained latent fields. Scene-level holdout is not possible here because each
-    # scene has its own latent field (auto-decoder).
-    validation_split_fraction = float(
-        get_spec_with_default(specs, "ValidationSplitFraction", 0.0)
-    )
-    validation_frequency = int(
-        get_spec_with_default(specs, "ValidationFrequency", log_frequency)
-    )
-    # cap held-out points evaluated per scene to bound validation cost
-    validation_max_points_per_scene = int(
-        get_spec_with_default(specs, "ValidationMaxPointsPerScene", 4096)
-    )
-
     # DataParallel is not supported for QNN (lightning.qubit is not GPU-aware).
     data_parallel = (not is_quantum) and torch.cuda.device_count() > 1
     decoder = ws.init_decoder(specs, device, data_parallel)
@@ -576,7 +556,6 @@ def train(
         num_samp_per_scene,
         load_ram=True,
         geom_dimension=geom_dimension,
-        held_out_fraction=validation_split_fraction,
     )
     num_scenes = len(sdf_dataset)
     logging.info(f"There are {num_scenes} scenes")
@@ -668,7 +647,6 @@ def train(
     timing_log = []
     lat_mag_log = []
     param_mag_log = {}
-    val_log = []  # list of [epoch, val_loss] pairs
 
     if continue_from is not None:
         # Normalize checkpoint name: ws functions expect name without .pth,
@@ -706,7 +684,6 @@ def train(
                 timing_log,
                 lat_mag_log,
                 param_mag_log,
-                val_log,
                 log_epoch,
             ) = load_logs(experiment_directory)
             if log_epoch != model_epoch:
@@ -716,14 +693,12 @@ def train(
                     timing_log,
                     lat_mag_log,
                     param_mag_log,
-                    val_log,
                 ) = clip_logs(
                     loss_log,
                     lr_log,
                     timing_log,
                     lat_mag_log,
                     param_mag_log,
-                    val_log,
                     model_epoch,
                 )
         except Exception:
@@ -736,49 +711,6 @@ def train(
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
-
-    # Build fixed held-out validation points per scene (point-level holdout).
-    # val_points[sid] is (xyz, sdf_gt) on device, or None if no points held out.
-    val_points = []
-    if validation_split_fraction > 0.0 and len(sdf_dataset.val_data) == num_scenes:
-        for sid in range(num_scenes):
-            pos_v, neg_v = sdf_dataset.val_data[sid]
-            samples_v = torch.cat([pos_v, neg_v], dim=0)
-            if samples_v.shape[0] == 0:
-                val_points.append(None)
-                continue
-            if samples_v.shape[0] > validation_max_points_per_scene:
-                sel = torch.randperm(samples_v.shape[0])[
-                    :validation_max_points_per_scene
-                ]
-                samples_v = samples_v[sel]
-            xyz_v = samples_v[:, 0:geom_dimension].to(device)
-            sdf_v = samples_v[:, geom_dimension].unsqueeze(1).to(device)
-            if enforce_minmax:
-                sdf_v = torch.clamp(sdf_v, minT, maxT)
-            val_points.append((xyz_v, sdf_v))
-    validation_enabled = any(vp is not None for vp in val_points)
-
-    def evaluate_validation():
-        """Mean reconstruction loss on held-out points, using trained fields."""
-        decoder.eval()
-        latent_fields.eval()
-        total = 0.0
-        count = 0
-        with torch.no_grad():
-            for sid in range(num_scenes):
-                vp = val_points[sid]
-                if vp is None:
-                    continue
-                xyz_v, sdf_v = vp
-                pred_v = structs[sid](xyz_v)
-                if enforce_minmax:
-                    pred_v = torch.clamp(pred_v, minT, maxT)
-                total += float(loss_fn(pred_v, sdf_v).item()) * xyz_v.shape[0]
-                count += xyz_v.shape[0]
-        decoder.train()
-        latent_fields.train()
-        return total / count if count > 0 else float("nan")
 
     logging.info("Starting training")
     decoder.train()
@@ -962,14 +894,6 @@ def train(
 
         append_parameter_magnitudes(param_mag_log, decoder)
 
-        val_loss = None
-        if validation_enabled and (
-            epoch % validation_frequency == 0 or epoch == num_epochs
-        ):
-            val_loss = evaluate_validation()
-            val_log.append([int(epoch), float(val_loss)])
-            logging.info(f"  Validation loss (held-out points): {val_loss:.4f}")
-
         if use_mlflow:
             epoch_metrics = {
                 "epoch_loss": float(avg_loss),
@@ -978,8 +902,6 @@ def train(
                 "lr_decoder": float(optimizer_all.param_groups[0]["lr"]),
                 "lr_latent_fields": float(optimizer_all.param_groups[1]["lr"]),
             }
-            if val_loss is not None:
-                epoch_metrics["val_loss"] = float(val_loss)
             mlflow.log_metrics(epoch_metrics, step=int(epoch))
 
         if epoch in checkpoints:
@@ -995,7 +917,6 @@ def train(
                 lat_mag_log,
                 param_mag_log,
                 epoch,
-                val_log=val_log,
             )
 
         if use_mlflow and (epoch % log_frequency == 0):
@@ -1069,9 +990,8 @@ def export_training_latent_fields_to_stl(
     os.makedirs(out_dir, exist_ok=True)
 
     # load decoder checkpoint
-    # NOTE: ws.load_trained_model usually expects checkpoint without ".pth" (often "latest"),
-    # but your training scripts save filenames like "latest.pth".
-    # We'll accept both.
+    # ws.load_trained_model expects the checkpoint without ".pth" (e.g. "latest"),
+    # while save_latent_fields writes filenames like "latest.pth" — accept both.
     ckpt_name = checkpoint
     ckpt_noext = checkpoint[:-4] if checkpoint.endswith(".pth") else checkpoint
 
@@ -1108,8 +1028,7 @@ def export_training_latent_fields_to_stl(
     with open(train_split_file, "r") as f:
         train_split = json.load(f)
 
-    # We only need dataset length + (optional) filenames.
-    # SDFSamples.__len__ equals number of scenes. :contentReference[oaicite:3]{index=3}
+    # We only need the dataset length here: SDFSamples.__len__ is the scene count.
     sdf_dataset = SDFSamples(
         data_source,
         train_split,
@@ -1172,6 +1091,6 @@ def export_training_latent_fields_to_stl(
 
 
 if __name__ == "__main__":
-    experiment_dir = "DeepSDFStruct/trained_models/primitives_cl35_new"
+    experiment_dir = "DeepSDFStruct/trained_models/primitives_cl32"
     train(experiment_dir)
     export_training_latent_fields_to_stl(experiment_dir, checkpoint="latest.pth")
