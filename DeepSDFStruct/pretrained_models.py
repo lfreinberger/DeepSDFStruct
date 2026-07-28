@@ -9,20 +9,20 @@ class PretrainedModels(Enum):
     ChiAndCross = "chi_and_cross"
     AnalyticRoundCross = "analytic_round_cross"
     RoundCross = "round_cross"
-    Primitives = "primitives"
+    # The primitive decoders differ only in latent code length. ``Primitives``
+    # is the default and aliases the widest (and best performing) one, so
+    # ``PrimitivesCL32 is PretrainedModels.Primitives``.
+    Primitives = "primitives_cl32"
+    PrimitivesCL32 = "primitives_cl32"
+    PrimitivesCL16 = "primitives_cl16"
+    PrimitivesCL08 = "primitives_cl08"
     Primitives2D = "primitives_2d"
 
 
 # Maps enum entries to file paths
 main_dir = importlib.resources.files("DeepSDFStruct")
 _MODEL_REGISTRY = {
-    PretrainedModels.ChiAndCross: main_dir / "trained_models" / "chi_and_cross",
-    PretrainedModels.AnalyticRoundCross: main_dir
-    / "trained_models"
-    / "analytic_round_cross",
-    PretrainedModels.RoundCross: main_dir / "trained_models" / "round_cross",
-    PretrainedModels.Primitives: main_dir / "trained_models" / "primitives",
-    PretrainedModels.Primitives2D: main_dir / "trained_models" / "primitives_2d",
+    model: main_dir / "trained_models" / model.value for model in PretrainedModels
 }
 
 

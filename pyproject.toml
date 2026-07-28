@@ -43,6 +43,8 @@ dependencies = [
     "pypardiso>=0.4.6; sys_platform != 'darwin' or platform_machine != 'arm64'",
     "mlflow>=3.5.0",
     "onnx>=1.20.1",
+    "pyvista",
+    "tqdm",
 ]
 
 [tool.setuptools_scm]

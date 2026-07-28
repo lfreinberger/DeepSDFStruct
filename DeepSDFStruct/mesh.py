@@ -1131,6 +1131,110 @@ def export_surface_mesh(
             gus.io.meshio.export(export_filename, mesh)
 
 
+def export_reconstructed_artifacts(
+    lattice_struct,
+    output_dir,
+    *,
+    mesh_resolution: int,
+    bounds,
+    device,
+    scaling=None,
+    extend_bounds: bool = True,
+    sdf_grid_N: int = 64,
+    sdf_grid_name: str = "reconstructed_sdf_grid.vtk",
+    param_mesh_name: str = "reconstructed_mesh_parameterspace.stl",
+    physical_mesh_name: str = "reconstructed_mesh.stl",
+    export_sdf_grid: bool = True,
+    export_param_mesh: bool = True,
+):
+    """Export a fitted lattice as an SDF grid plus surface meshes.
+
+    Writes up to three files into ``output_dir``: a sampled SDF grid (VTK), the
+    surface mesh in parameter space, and -- if ``scaling`` is given -- the same
+    surface mesh mapped back to physical space. Mesh extraction is wrapped in
+    :func:`DeepSDFStruct.utils.with_float32_lattice`, so this is safe to call on
+    a lattice whose parameters are held in float64.
+
+    Parameters
+    ----------
+    lattice_struct : LatticeSDFStruct
+        Structure to evaluate. Its parametrization should already hold the
+        fitted control points.
+    output_dir : str or pathlib.Path
+        Destination directory. Must already exist.
+    mesh_resolution : int
+        FlexiCubes grid resolution per dimension for the surface meshes.
+    bounds : torch.Tensor
+        (2, 3) evaluation bounds.
+    device : str or torch.device
+        Device used for mesh extraction.
+    scaling : TorchScaling, optional
+        Parameter-to-physical-space map. If None, only the parameter-space
+        mesh is written.
+    extend_bounds : bool, default True
+        Passed through to :func:`create_3D_mesh`; extends the sampling grid
+        slightly beyond ``bounds`` so surfaces touching the domain border close.
+    sdf_grid_N : int, default 64
+        Resolution of the exported SDF grid.
+    sdf_grid_name, param_mesh_name, physical_mesh_name : str
+        Output file names within ``output_dir``.
+    export_sdf_grid, export_param_mesh : bool, default True
+        Toggles for the two optional outputs. Turn off to keep runs light.
+
+    Returns
+    -------
+    pathlib.Path
+        Path of the physical-space mesh, or of the parameter-space mesh when
+        no ``scaling`` was given.
+    """
+    from DeepSDFStruct.utils import with_float32_lattice
+
+    output_dir = pathlib.Path(output_dir)
+
+    def _export(bounds_f32):
+        if export_sdf_grid:
+            export_sdf_grid_vtk(
+                lattice_struct,
+                N=sdf_grid_N,
+                filename=str(output_dir / sdf_grid_name),
+                bounds=bounds_f32,
+            )
+
+        if export_param_mesh:
+            ps_mesh, ps_deriv = create_3D_mesh(
+                lattice_struct,
+                mesh_resolution,
+                mesh_type="surface",
+                differentiate=False,
+                device=device,
+                bounds=bounds_f32,
+                extend_bounds=extend_bounds,
+            )
+            export_surface_mesh(
+                str(output_dir / param_mesh_name), ps_mesh.to_gus(), ps_deriv
+            )
+
+        if scaling is None:
+            return output_dir / param_mesh_name
+
+        phys_mesh, phys_deriv = create_3D_mesh(
+            lattice_struct,
+            mesh_resolution,
+            mesh_type="surface",
+            differentiate=False,
+            device=device,
+            bounds=bounds_f32,
+            deformation_function=scaling,
+            extend_bounds=extend_bounds,
+        )
+        export_surface_mesh(
+            str(output_dir / physical_mesh_name), phys_mesh.to_gus(), phys_deriv
+        )
+        return output_dir / physical_mesh_name
+
+    return with_float32_lattice(lattice_struct, bounds, _export)
+
+
 def mergeMeshs(mesh1, mesh2, tol=1e-10):
     vertices1 = mesh1.vertices
     vertices2 = mesh2.vertices

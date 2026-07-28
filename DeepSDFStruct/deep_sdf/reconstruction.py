@@ -21,7 +21,7 @@ def reconstruct_from_samples(
     loss_plot_path=None,
     loss_csv_path=None,
     optimizer_name="adam",
-    deformation_function=None | TorchSpline | TorchScaling,
+    deformation_function: TorchSpline | TorchScaling | None = None,
     code_reg_lambda: float = 0.0,
     code_bound: float | None = None,
     grad_clip: float | None = None,
