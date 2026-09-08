@@ -503,8 +503,16 @@ class LocalShapesReconstructor:
         loss_plot_path=None,
         loss_csv_path=None,
         step_callback: Callable[[int, int, int], None] | None = None,
+        loss_fn: str = "ClampedL1",
+        clamp_val: float = 0.1,
     ) -> dict[str, Any]:
         """Optimize *struct*'s latent codes against *samples*.
+
+        ``loss_fn`` / ``clamp_val``: ``"ClampedL1"`` (default, clamp 0.1 as in
+        DeepSDF training) supervises only the near-surface band -- far-field
+        SDF values are free once they exceed the clamp, so empty lattice tiles
+        get no reserve above zero. ``"L1"`` (or a larger clamp) fits the far
+        field too.
 
         Static: everything needed is already inside ``struct``, so this can be
         called as ``LocalShapesReconstructor.fit_samples(struct, samples, ...)``
@@ -552,7 +560,8 @@ class LocalShapesReconstructor:
             samples,
             num_iterations=num_iterations,
             lr=lr,
-            loss_fn="ClampedL1",
+            loss_fn=loss_fn,
+            clamp_val=clamp_val,
             batch_size=batch_size,
             use_tanh_on_gt=False,
             loss_plot_path=loss_plot_path,

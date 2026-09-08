@@ -27,6 +27,7 @@ def reconstruct_from_samples(
     grad_clip: float | None = None,
     eikonal_lambda: float = 0.0,
     step_callback=None,
+    clamp_val: float = 0.1,
 ):
     if optimizer_name == "adam":
         optimizer = torch.optim.Adam(sdf.parameters(), lr=lr)
@@ -75,7 +76,7 @@ def reconstruct_from_samples(
     if loss_fn == "L1":
         Loss = torch.nn.L1Loss()
     elif loss_fn == "ClampedL1":
-        Loss = ClampedL1Loss(clamp_val=0.1)
+        Loss = ClampedL1Loss(clamp_val=clamp_val)
     elif loss_fn == "MSE":
         Loss = torch.nn.MSELoss()
     else:
