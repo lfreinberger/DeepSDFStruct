@@ -114,6 +114,7 @@ class LatticeSDFStruct(_SDFBase):
         microtile: _SDFBase | None = None,
         parametrization: _torch.nn.Module | None = None,
         bounds=None,
+        tiling_map: str = "hat",
     ):
         """Helper class to facilitate the construction of microstructures.
 
@@ -128,7 +129,19 @@ class LatticeSDFStruct(_SDFBase):
           Representation of the building block defined in the unit cube
         parametrization_function : Callable (optional)
           Function to describe spline parameters
+        tiling_map : {"hat", "cosine"}
+          How a global coordinate is folded into the microtile coordinate
+          u in [-1, 1] (see :func:`transform`). ``"hat"`` is the piecewise
+          linear triangle wave (mirrored tiles, C0 seams: the derivative flips
+          sign at every tile plane). ``"cosine"`` uses u = -cos(pi*t*x): same
+          values at tile planes/centres, but smooth (u' = 0 at the planes), so
+          the composed SDF is as smooth as the latent field and the decoder.
+          Note that with "cosine" the map is not isometric: tiles are stretched
+          near their planes and |grad phi| loses its along-axis component there.
         """
+        if tiling_map not in TILING_MAPS:
+            raise ValueError(f"tiling_map must be one of {TILING_MAPS}, got {tiling_map!r}")
+        self.tiling_map = tiling_map
         if not isinstance(parametrization, _torch.nn.Module):
             raise TypeError("Parametrization must be of type _Parametrization")
         super().__init__(parametrization=parametrization)
@@ -207,7 +220,8 @@ class LatticeSDFStruct(_SDFBase):
         queries_transformed = _torch.zeros_like(inside_samples)
         for i_dim, t in enumerate(self.tiling):
             queries_transformed[:, i_dim] = transform(
-                inside_samples[:, i_dim], t, bounds=bounds[:, i_dim]
+                inside_samples[:, i_dim], t, bounds=bounds[:, i_dim],
+                tiling_map=self.tiling_map,
             )
 
         inside_sdf = self.microtile(queries_transformed)
@@ -277,11 +291,31 @@ def constantLatvec(value):
     return _BSpline([0, 0, 0], [[-1, 1], [-1, 1], [-1, 1]], [value])
 
 
-def transform(x, t, bounds=[0, 1]):
-    # transform x from [bounds[0], bounds[1]] to [-1,1]
+TILING_MAPS = ("hat", "cosine")
+
+
+def transform(x, t, bounds=[0, 1], tiling_map="hat"):
+    """Fold the global coordinate ``x`` in ``bounds`` into the microtile
+    coordinate u in [-1, 1] with ``t`` tiles.
+
+    Both maps give u = -1 at the lower bound and at every even tile plane,
+    u = +1 at every odd tile plane (adjacent tiles are mirror images):
+
+    * ``"hat"``: triangle wave, linear within each tile. Isometric (|u'| = 2t
+      in normalized units) but C0 at the tile planes -- u' flips sign there,
+      which creases the composed SDF unless the surface crosses the plane
+      perpendicularly.
+    * ``"cosine"``: u = -cos(pi * t * x_norm). Smooth (C-infinity), u' = 0 at
+      the tile planes, so the composed SDF has no seams; not isometric (tiles
+      are stretched towards their planes).
+    """
     x_norm = (x - bounds[0]) / (bounds[1] - bounds[0])
-    x_transformed = 2 * _torch.abs(t * x_norm / 2 - _torch.floor((t * x_norm + 1) / 2))
-    return 2 * x_transformed - 1
+    if tiling_map == "hat":
+        x_transformed = 2 * _torch.abs(t * x_norm / 2 - _torch.floor((t * x_norm + 1) / 2))
+        return 2 * x_transformed - 1
+    if tiling_map == "cosine":
+        return -_torch.cos(_torch.pi * t * x_norm)
+    raise ValueError(f"tiling_map must be one of {TILING_MAPS}, got {tiling_map!r}")
 
 
 def check_tiling_input(tiling):
