@@ -265,6 +265,10 @@ class MMA:
 
     def __init__(self, parameters, bounds, max_step=0.1, n_constraints=1):
         self.max_step = max_step
+        # Move limit as configured. self.max_step may be adapted between steps by a
+        # trust-region controller in the driver; the feasibility restoration (a
+        # geometry-only projection, no CFD) keeps this initial value as its default cap.
+        self.max_step_initial = float(max_step)
         self.bounds = np.asarray(bounds, dtype=float)
         self.parameters = parameters
 
@@ -318,7 +322,7 @@ class MMA:
         cannot reduce the worst violation (evaluation-noise floor) -- the residual is
         logged either way.
         """
-        lim = float(step_limit) if step_limit is not None else float(self.max_step)
+        lim = float(step_limit) if step_limit is not None else float(self.max_step_initial)
         lo, hi = self.bounds[:, 0:1], self.bounds[:, 1:2]
         g, J = restore_eval(x)
         g = np.asarray(g, dtype=float).reshape(-1)
@@ -439,7 +443,9 @@ class MMA:
             Maximum Gauss-Newton passes per outer iteration (default 8; typically 1-2
             are used). Each pass costs one geometry evaluation plus up to 4 backtracks.
         restore_step_limit : float, optional
-            Per-pass infinity-norm cap on the correction; defaults to ``max_step``.
+            Per-pass infinity-norm cap on the correction; defaults to the move limit
+            as configured (``max_step_initial``), not to a move limit shrunk by the
+            driver's step control.
 
         Notes
         -----
