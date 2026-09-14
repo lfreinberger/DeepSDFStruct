@@ -170,9 +170,22 @@ class MMA:
     constrained problems. It constructs convex subproblems using moving
     asymptotes and is particularly effective for structural optimization.
 
-    The optimizer handles a single objective function and a single constraint,
-    with box bounds on design variables. It automatically normalizes the
-    objective by its initial value for better numerical behavior.
+    The optimizer handles a single objective function and ``n_constraints``
+    constraint rows, with box bounds on design variables.
+
+    **Scaling (the only place it happens).** MMA is not scale invariant: the fixed
+    curvature ``raa0/(xmax-xmin)`` of the subproblem and the elastic penalty
+    ``c_i`` are absolute numbers, so Svanberg (2007, "MMA and GCMMA -- two methods
+    for nonlinear optimization") recommends feeding it O(1)..O(100) values. This
+    class applies the textbook scaling itself, so callers pass RAW values:
+
+    * objective:   ``f0 = F / |F(x_0)|`` (normalized by the initial value);
+    * constraints: ``f_i = (value - target) / |target|`` -- "fraction over budget" --
+      when the per-row targets are supplied via ``step(..., G_scale=...)``. Rows
+      without a scale (``None`` / ``0``) are taken as already dimensionless.
+
+    Never pre-scale rows with absolute floors on the caller side; a floor larger
+    than the target silently turns the constraint into an artificial trust region.
 
     Parameters
     ----------
@@ -272,7 +285,26 @@ class MMA:
 
         self.loop = 0
         self.ch = 1.0
-        self.F0 = None
+        self.F0 = None  # |F(x_0)|, objective scale (set on the first step)
+        self.G_scale = np.ones((self.m, 1))  # per-row constraint scales (see step)
+        # Stationarity diagnostics of the last step (scaled units, see step).
+        self.lam = np.zeros((self.m, 1))  # constraint multipliers of the subproblem
+        self.kkt_norm = float("nan")  # ||projected grad of the Lagrangian||_2 at x_k
+
+    def _row_scales(self, G_scale):
+        """Per-row constraint scales (m, 1): ``|G_scale[i]|``, or 1 for None/0 entries."""
+        if G_scale is None:
+            return np.ones((self.m, 1))
+        vals = np.atleast_1d(np.asarray(
+            [0.0 if v is None else float(v) for v in np.atleast_1d(np.asarray(G_scale, dtype=object))],
+            dtype=float,
+        )).reshape(-1)
+        if vals.size != self.m:
+            raise ValueError(f"G_scale has {vals.size} entries, expected {self.m} rows")
+        scale = np.abs(vals)
+        unscaled = ~np.isfinite(scale) | (scale == 0.0)
+        scale[unscaled] = 1.0
+        return scale.reshape(self.m, 1)
 
     def _restore_feasibility(self, x, restore_eval, tol, max_steps, step_limit):
         """Project an accepted candidate back onto the cheap-constraint feasible set.
@@ -340,8 +372,8 @@ class MMA:
             )
         return x
 
-    def step(self, F, dF, G, dG, geom_eval=None, geom_rows=None, max_inner=1,
-             feas_tol=0.05, restore_eval=None, restore_tol=5e-3,
+    def step(self, F, dF, G, dG, G_scale=None, geom_eval=None, geom_rows=None,
+             max_inner=1, feas_tol=0.05, restore_eval=None, restore_tol=5e-3,
              restore_max_steps=8, restore_step_limit=None):
         """Perform one MMA optimization step.
 
@@ -355,14 +387,24 @@ class MMA:
         dF : torch.Tensor
             Gradient of objective w.r.t. design variables, shape (n,).
         G : torch.Tensor or float
-            Constraint function value at current design (≤ 0 is feasible).
+            RAW constraint rows ``value - target`` at the current design, shape
+            (m,) (≤ 0 is feasible). Do not pre-scale; see ``G_scale``.
         dG : torch.Tensor
-            Gradient of constraint w.r.t. design variables, shape (n,).
+            RAW gradients of the constraint rows w.r.t. design variables, shape (m, n).
+        G_scale : sequence of float or None, optional
+            Per-row reference scale, normally the row's TARGET value: row ``i`` (value
+            and gradient) is divided by ``|G_scale[i]|`` so the subproblem sees the
+            dimensionless "fraction over budget" ``value/target - 1``. Entries that
+            are ``None`` or ``0`` leave the row unscaled (already dimensionless rows
+            such as KS margins). ``None`` (default) scales no row. The same scale is
+            applied to what ``geom_eval`` / ``restore_eval`` return, so those
+            callbacks return raw ``value - target`` rows as well.
         geom_eval : callable, optional
             Cheap geometry-only re-evaluation ``x_np -> np.ndarray``. Given a
-            candidate design vector it returns the *true* (nonlinear) constraint
-            values ``g = value - target`` for the rows listed in ``geom_rows``,
-            without running the expensive (CFD) objective/constraints. Enables the
+            candidate design vector it returns the *true* (nonlinear) RAW constraint
+            values ``g = value - target`` for the rows listed in ``geom_rows``
+            (scaled here by ``G_scale`` like ``G``), without running the expensive
+            (CFD) objective/constraints. Enables the
             hybrid-GCMMA conservativeness loop; when ``None`` this is a plain MMA
             step.
         geom_rows : sequence of int, optional
@@ -383,9 +425,9 @@ class MMA:
             burns max_inner solves per iteration for nothing.
         restore_eval : callable, optional
             Enables POST-STEP FEASIBILITY RESTORATION on the cheap geometry rows:
-            ``x_np -> (g, J)`` returning the true values (k,) AND their gradients
-            (k, n) -- masked for locked variables, in the same normalized units as the
-            constraint rows. After the step is accepted (through whichever gate), the
+            ``x_np -> (g, J)`` returning the true RAW values (k,) AND their gradients
+            (k, n) for the ``geom_rows`` -- masked for locked variables; scaled here by
+            ``G_scale`` like ``G``. After the step is accepted (through whichever gate), the
             candidate is projected back onto the geometry-feasible set with
             minimum-norm Gauss-Newton passes, so geometry violations beyond
             ``restore_tol`` cannot survive an iteration. Independent of the GCMMA
@@ -402,13 +444,14 @@ class MMA:
         Notes
         -----
         The method automatically:
-        - Normalizes the objective by its initial value
+        - Scales the objective by |F(x_0)| and the constraint rows by |G_scale|
         - Enforces move limits based on max_step
         - Updates MMA history (xold1, xold2)
         - Computes and logs convergence metric (ch)
         - Updates self.parameters in-place
 
-        The convergence metric ch is the relative change in design variables.
+        The convergence metric ``ch`` is the mean absolute change of the design
+        variables relative to their mean magnitude.
         """
         F_np = np.asarray(F.detach().cpu().numpy(), dtype=float).reshape(1, 1)
         dFdx_np = np.asarray(dF.detach().cpu().numpy(), dtype=float).reshape(self.n, 1)
@@ -418,11 +461,55 @@ class MMA:
             self.m, self.n
         )
 
+        # --- Scaling: the one place where objective and constraint rows are made O(1)
+        # (see the class docstring). Objective by |F(x_0)| (abs: a negative initial
+        # value must not flip the descent direction); rows by |G_scale|.
         if self.loop == 0:
-            self.F0 = F_np.copy()
+            F0 = abs(float(F_np[0, 0]))
+            if not np.isfinite(F0) or F0 == 0.0:
+                logger.warning(
+                    f"MMA: initial objective {F_np[0, 0]!r} unusable as scale, using 1.0"
+                )
+                F0 = 1.0
+            self.F0 = F0
+        self.G_scale = self._row_scales(G_scale)
+        if self.loop == 0:
+            logger.info(
+                f"MMA scaling: objective / {self.F0:.3e}, constraint rows / "
+                f"{self.G_scale.reshape(-1).tolist()}"
+            )
 
         F_np = F_np / self.F0
         dFdx_np = dFdx_np / self.F0
+        G_np = G_np / self.G_scale
+        dGdx_np = dGdx_np / self.G_scale
+
+        # The cheap re-evaluation callbacks return raw rows too: scale them identically.
+        if geom_eval is not None and geom_rows is not None:
+            _geom_eval_raw = geom_eval
+            _geom_scale = self.G_scale.reshape(-1)[list(geom_rows)]
+
+            def geom_eval(x_np):
+                return np.asarray(_geom_eval_raw(x_np), dtype=float).reshape(-1) / _geom_scale
+
+        if restore_eval is not None:
+            _restore_raw = restore_eval
+            _restore_scale = (
+                self.G_scale.reshape(-1)[list(geom_rows)]
+                if geom_rows is not None
+                else self.G_scale.reshape(-1)
+            )
+
+            def restore_eval(x_np):
+                g, J = _restore_raw(x_np)
+                g = np.asarray(g, dtype=float).reshape(-1)
+                J = np.asarray(J, dtype=float).reshape(g.size, -1)
+                if g.size != _restore_scale.size:
+                    raise ValueError(
+                        f"restore_eval returned {g.size} rows, expected "
+                        f"{_restore_scale.size} (geom_rows)"
+                    )
+                return g / _restore_scale, J / _restore_scale[:, None]
 
         # Hybrid GCMMA conservativeness loop (Svanberg 2002, CCSA). Solve the subproblem,
         # then -- when a cheap geometry-only re-evaluation callback is supplied -- check
@@ -554,13 +641,33 @@ class MMA:
                 restore_max_steps, restore_step_limit,
             )
 
+        # Stationarity (KKT) residual at the CURRENT point x_k, in the scaled units the
+        # subproblem sees: r = df0/dx + sum_i lam_i dfi/dx with the subproblem's constraint
+        # multipliers, projected onto the TRUE box bounds (self.bounds): at a lower bound
+        # only r < 0 counts, at an upper bound only r > 0. The move-limited xmin/xmax must
+        # not be used here -- every MMA step lands on the move limit, so their multipliers
+        # would absorb the gradient and report a false zero. Locked variables carry zero
+        # gradients and contribute nothing.
+        lam_np = np.asarray(lam, dtype=float).reshape(self.m, 1)
+        r = dFdx_np + dGdx_np.T @ lam_np
+        lb, ub = self.bounds[:, 0:1], self.bounds[:, 1:2]
+        tol = 1e-9 * np.maximum(ub - lb, 1.0)
+        r = np.where(self.x <= lb + tol, np.minimum(r, 0.0), r)
+        r = np.where(self.x >= ub - tol, np.maximum(r, 0.0), r)
+        self.lam = lam_np.copy()
+        self.kkt_norm = float(np.linalg.norm(r))
+
         self.xold2 = self.xold1.copy()
         self.xold1 = self.x.copy()
         self.x = xmma
         self.low = low
         self.upp = upp
 
-        self.ch = np.abs(np.mean(self.x.T - self.xold1.T) / np.mean(self.x.T))
+        # Mean |dx| relative to the mean |x| (the former signed-mean ratio cancelled
+        # out and read as noise).
+        self.ch = float(
+            np.abs(self.x - self.xold1).mean() / max(np.abs(self.x).mean(), 1e-300)
+        )
 
         with torch.no_grad():
             self.parameters.copy_(
@@ -572,6 +679,7 @@ class MMA:
             )
 
         logger.info(
-            f"It.: {self.loop:4d} | J.: {F_np[0,0]:1.3e} | "
-            f"G: {[float(g) for g in G_np[:, 0]]} | ch.: {self.ch:1.3e}"
+            f"It.: {self.loop:4d} | J/J0: {F_np[0,0]:1.3e} | "
+            f"G (scaled): {[float(g) for g in G_np[:, 0]]} | ch.: {self.ch:1.3e} | "
+            f"KKT: {self.kkt_norm:1.3e}"
         )
