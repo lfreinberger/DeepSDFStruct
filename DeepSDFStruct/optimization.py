@@ -663,6 +663,19 @@ class MMA:
         self.lam = lam_np.copy()
         self.kkt_norm = float(np.linalg.norm(r))
 
+        # Which limiter sets the subproblem's per-variable bound: the moving asymptote
+        # or the move limit? mmasub uses beta = min(x + (1-albefa)*(upp-x), x + move*(xmax-xmin))
+        # with albefa=0.1 and move=0.5, and xmax-xmin = 2*max_step here, so the asymptote
+        # binds exactly where 0.9*(upp-x) < max_step (likewise for low). asy_bind_frac
+        # oscillating with the step is the signature of an asymptote-driven limit cycle;
+        # asy_bind_frac == 0 means the move limit alone sets every step.
+        asy_u = (upp - self.x).reshape(-1)
+        asy_l = (self.x - low).reshape(-1)
+        ms = float(self.max_step)
+        self.asy_upp_med = float(np.median(asy_u)) / ms if ms > 0 else float("nan")
+        self.asy_low_med = float(np.median(asy_l)) / ms if ms > 0 else float("nan")
+        self.asy_bind_frac = float(np.mean((0.9 * asy_u < ms) | (0.9 * asy_l < ms)))
+
         self.xold2 = self.xold1.copy()
         self.xold1 = self.x.copy()
         self.x = xmma
@@ -687,5 +700,7 @@ class MMA:
         logger.info(
             f"It.: {self.loop:4d} | J/J0: {F_np[0,0]:1.3e} | "
             f"G (scaled): {[float(g) for g in G_np[:, 0]]} | ch.: {self.ch:1.3e} | "
-            f"KKT: {self.kkt_norm:1.3e}"
+            f"KKT: {self.kkt_norm:1.3e} | asy(upp/low, x max_step): "
+            f"{self.asy_upp_med:1.2f}/{self.asy_low_med:1.2f} | asy_bind: "
+            f"{self.asy_bind_frac:.3f}"
         )
