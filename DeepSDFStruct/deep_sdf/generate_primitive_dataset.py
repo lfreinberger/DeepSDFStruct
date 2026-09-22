@@ -152,9 +152,10 @@ def _make_primitive(
         sdf = BoxSDF(center=[0.0, 0.0, 0.0], extents=extents)
         mesh = trimesh.creation.box(extents=extents)
     elif prim_type == "cylinder":
-        # unit cylinder: radius 1 (x/y), height 2 (half-height 1 along z)
+        # unit cylinder: radius 1 (x/y), height 2 (half-height 1 along z), which
+        # matches trimesh.creation.cylinder(radius=1, height=2) below.
         unit_sdf = CylinderSDF(
-            point=[0.0, 0.0, 0.0], axis=[0.0, 0.0, 1.0], radius=1.0, height=2.0
+            point_a=[0.0, 0.0, -1.0], point_b=[0.0, 0.0, 1.0], radius=1.0
         )
         sdf = _AnisoScaledSDF(unit_sdf, scale_vec)
         mesh = trimesh.creation.cylinder(radius=1.0, height=2.0, sections=32)
@@ -208,7 +209,9 @@ def _filter_to_bounds(sampled: SampledSDF, bounds: np.ndarray) -> SampledSDF:
     lo = torch.tensor(bounds[0], dtype=sampled.samples.dtype)
     hi = torch.tensor(bounds[1], dtype=sampled.samples.dtype)
     inside = ((sampled.samples >= lo) & (sampled.samples <= hi)).all(dim=1)
-    return SampledSDF(samples=sampled.samples[inside], distances=sampled.distances[inside])
+    return SampledSDF(
+        samples=sampled.samples[inside], distances=sampled.distances[inside]
+    )
 
 
 def generate_primitive_dataset(cfg: dict) -> dict:
@@ -271,13 +274,10 @@ def generate_primitive_dataset(cfg: dict) -> dict:
                 scene_sdf,
                 bounds=bounds.tolist(),
                 n_samples=int(cfg["n_uniform"]),
-                type="uniform",
+                sampling_strategy="uniform",
             )
             surface = sample_mesh_surface(
-                scene_sdf,
-                scene_mesh,
-                int(cfg["n_surface_per_std"]),
-                list(cfg["stds"]),
+                scene_sdf, scene_mesh, int(cfg["n_surface_per_std"]), list(cfg["stds"])
             )
             combined = uniform + surface
             # near-surface Gaussian perturbations can push points past the box;

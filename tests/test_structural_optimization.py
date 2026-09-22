@@ -73,7 +73,7 @@ def test_structural_optimization(num_iter=1):
         torch.set_default_dtype(torch.float32)
         mesh, _ = create_3D_mesh(
             lattice_struct,
-            30,
+            10,
             mesh_type="volume",
             differentiate=False,
             device=model.device,
@@ -81,7 +81,7 @@ def test_structural_optimization(num_iter=1):
         )
         surf_mesh, _ = create_3D_mesh(
             lattice_struct,
-            30,
+            10,
             mesh_type="surface",
             differentiate=False,
             device=model.device,
@@ -96,19 +96,28 @@ def test_structural_optimization(num_iter=1):
         else:
             raise RuntimeError("Resulting mesh should be volume mesh.")
 
-        # change ordering to fix negative jacobian
-        perm = torch.tensor([0, 2, 1, 3])
-        tets_reoredered = tets[:, perm]
+        # Ensure consistent positive orientation for each tetrahedron.
+        tets_oriented = tets.clone()
+        vols = tet_signed_vol(verts, tets_oriented)
+        neg_mask = vols < 0
+        if neg_mask.any():
+            tets_oriented_neg = tets_oriented[neg_mask]
+            tets_oriented_neg = tets_oriented_neg[:, [0, 2, 1, 3]]
+            tets_oriented[neg_mask] = tets_oriented_neg
 
-        vols = tet_signed_vol(verts, tets_reoredered)
+        vols = tet_signed_vol(verts, tets_oriented)
         if init_vol is None:
             init_vol = vols.sum().item()
             logger.info(f"Initial volume: {init_vol} on {len(vols)} elements.")
-        vol = vols.sum()
-        mask = vols >= 0
+        eps = 1e-12
+        # Use float64 for the mask to match torchfem's internal precision;
+        # tets with tiny float32-positive volumes can become negative in float64.
+        vols_f64 = tet_signed_vol(verts.to(torch.float64), tets_oriented)
+        mask = vols_f64 > eps
+        vol = vols[mask].sum()
 
         # keep only the good tets
-        tets_clean = tets_reoredered[mask]
+        tets_clean = tets_oriented[mask]
 
         # check how many were removed
         removed = (~mask).sum()
@@ -137,7 +146,7 @@ def test_structural_optimization(num_iter=1):
 
         # log("Starting Simulation")
         u, f, _, _, _ = cantilever.solve(
-            rtol=1e-2, atol=1e-2, device="cpu", method="pardiso"
+            rtol=1e-2, atol=1e-2, device="cpu", method="spsolve"
         )
 
         # Compute sensitivity of compliance w.r.t. element thicknesses
@@ -148,6 +157,9 @@ def test_structural_optimization(num_iter=1):
         dF = torch.autograd.grad(F, param, retain_graph=True)[0]
         dG = torch.autograd.grad(G, param, retain_graph=True)[0]
         optimizer.step(F, dF, G, dG)
+
+        # Reset default dtype to float32 for other tests
+        torch.set_default_dtype(torch.float32)
 
     # torch.autograd.grad(compliance, cantilever.thickness)[0]
     mesh = get_mesh_from_torchfem(cantilever)

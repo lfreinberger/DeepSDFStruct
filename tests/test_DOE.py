@@ -1,9 +1,9 @@
 from DeepSDFStruct.design_of_experiments import run_experiment, ExperimentSpecifications
-from huggingface_hub import snapshot_download
+from _hf_helpers import snapshot_download_with_retry
 
 
 def test_DOE():
-    data_dir = snapshot_download(
+    data_dir = snapshot_download_with_retry(
         "mkofler/lattice_structure_unit_cells",
         repo_type="dataset",
         revision="b80339abc071df77ff81e8abc19ad4856d96ddbd",

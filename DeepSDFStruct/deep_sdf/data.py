@@ -1,3 +1,43 @@
+"""
+DeepSDF Data Loading and Preprocessing
+======================================
+
+This module provides PyTorch Dataset classes and utilities for loading
+and preprocessing SDF training data. It handles:
+
+- Loading sampled SDF values from .npz files
+- Splitting samples into positive and negative regions
+- Batching and shuffling for training
+- Data normalization and clamping
+- Multi-class and multi-dataset support
+
+The module is designed to work with the dataset format produced by the
+sampling module, where each geometry is stored as a .npz file containing
+positive and negative SDF samples.
+
+Classes
+-------
+SDFSamples
+    PyTorch Dataset for loading SDF samples with lazy loading and caching.
+
+NoMeshFileError
+    Exception raised when a mesh file cannot be found.
+
+MultipleMeshFileError
+    Exception raised when multiple mesh files exist in a directory.
+
+Functions
+---------
+get_instance_filenames
+    Retrieve file paths for all instances in a dataset split.
+
+unpack_sdf_samples
+    Load and preprocess SDF samples from a .npz file.
+
+read_sdf_samples_into_ram
+    Load entire dataset into RAM for faster training.
+"""
+
 #!/usr/bin/env python3
 # Copyright 2004-present Facebook. All Rights Reserved.
 
@@ -10,6 +50,8 @@ import torch
 import torch.utils.data
 
 import DeepSDFStruct.deep_sdf.workspace as ws
+
+logger = logging.getLogger(__name__)
 
 
 def get_instance_filenames(data_source, split):
@@ -171,7 +213,7 @@ class SDFSamples(torch.utils.data.Dataset):
         self.data_source = data_source
         self.npyfiles = get_instance_filenames(data_source, split)
         self.filenames = []
-        logging.debug(
+        logger.debug(
             "using "
             + str(len(self.npyfiles))
             + " shapes from data source "
@@ -195,9 +237,9 @@ class SDFSamples(torch.utils.data.Dataset):
                         neg_tensor[torch.randperm(neg_tensor.shape[0])],
                     ]
                 )
-                if "E" in npz.keys():
+                if "C" in npz.keys():
                     self.loaded_mat_properties.append(
-                        torch.from_numpy(npz["E.npy"]).to(torch.float32)
+                        torch.from_numpy(npz["C.npy"]).to(torch.float32).reshape(-1)
                     )
                 self.filenames.append(filename)
 
@@ -215,12 +257,12 @@ class SDFSamples(torch.utils.data.Dataset):
         if self.load_ram:
             return (
                 unpack_sdf_samples_from_ram(self.loaded_data[idx], self.subsample),
-                mat_prop,
+                mat_prop.unsqueeze(0).expand(self.subsample, -1),
                 idx,
             )
         else:
             return (
                 unpack_sdf_samples(filename, self.geom_dimension, self.subsample),
-                mat_prop,
+                mat_prop.unsqueeze(0).expand(self.subsample, -1),
                 idx,
             )

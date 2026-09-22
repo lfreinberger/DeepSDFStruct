@@ -1,3 +1,19 @@
+"""
+FlexiCubes Implementation
+=========================
+
+This module contains the core implementation of the FlexiCubes algorithm,
+a differentiable 3D mesh extraction method that improves upon traditional
+Dual Marching Cubes.
+
+FlexiCubes dynamically adjusts surface representations through gradient-based
+optimization, enhancing geometric fidelity and mesh quality. The method is
+particularly useful for neural implicit representations and inverse design.
+
+Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+Licensed under the Apache License, Version 2.0.
+"""
+
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved.
 #
@@ -12,61 +28,82 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
+
 import torch
+import warnings
 from DeepSDFStruct.flexicubes.tables import *
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["FlexiCubes"]
 
 
 class FlexiCubes:
     """
-    This class implements the DeepSDFStruct.flexicubes method for extracting meshes from scalar fields.
-    It maintains a series of lookup tables and indices to support the mesh extraction process.
-    DeepSDFStruct.flexicubes, a differentiable variant of the Dual Marching Cubes (DMC) scheme, enhances
-    the geometric fidelity and mesh quality of reconstructed meshes by dynamically adjusting
-    the surface representation through gradient-based optimization.
+    This class implements the flexicubes method for extracting meshes
+    from scalar fields. It maintains a series of lookup tables and
+    indices to support the mesh extraction process. Flexicubes, a
+    differentiable variant of the Dual Marching Cubes (DMC) scheme,
+    enhances the geometric fidelity and mesh quality of reconstructed
+    meshes by dynamically adjusting the surface representation through
+    gradient-based optimization.
 
-    During instantiation, the class loads DMC tables from a file and transforms them into
-    PyTorch tensors on the specified device.
+    During instantiation, the class loads DMC tables from a file and
+    transforms them into PyTorch tensors on the specified device.
 
     Attributes:
-        device (str): Specifies the computational device (default is "cuda").
-        dmc_table (torch.Tensor): Dual Marching Cubes (DMC) table that encodes the edges
-            associated with each dual vertex in 256 Marching Cubes (MC) configurations.
-        num_vd_table (torch.Tensor): Table holding the number of dual vertices in each of
-            the 256 MC configurations.
-        check_table (torch.Tensor): Table resolving ambiguity in cases C16 and C19
-            of the DMC configurations.
-        tet_table (torch.Tensor): Lookup table used in tetrahedralizing the isosurface.
-        quad_split_1 (torch.Tensor): Indices for splitting a quad into two triangles
-            along one diagonal.
-        quad_split_2 (torch.Tensor): Alternative indices for splitting a quad into
-            two triangles along the other diagonal.
-        quad_split_train (torch.Tensor): Indices for splitting a quad into four triangles
-            during training by connecting all edges to their midpoints.
-        cube_corners (torch.Tensor): Defines the positions of a standard unit cube's
-            eight corners in 3D space, ordered starting from the origin (0,0,0),
-            moving along the x-axis, then y-axis, and finally z-axis.
-            Used as a blueprint for generating a voxel grid.
-        cube_corners_idx (torch.Tensor): Cube corners indexed as powers of 2, used
-            to retrieve the case id.
-        cube_edges (torch.Tensor): Edge connections in a cube, listed in pairs.
-            Used to retrieve edge vertices in DMC.
-        edge_dir_table (torch.Tensor): A mapping tensor that associates edge indices with
-            their corresponding axis. For instance, edge_dir_table[0] = 0 indicates that the
+        device (str): Specifies the computational device (default
+            "cuda").
+        dmc_table (torch.Tensor): Dual Marching Cubes (DMC) table
+            that encodes the edges associated with each dual vertex
+            in 256 Marching Cubes (MC) configurations.
+        num_vd_table (torch.Tensor): Table holding the number of
+            dual vertices in each of the 256 MC configurations.
+        check_table (torch.Tensor): Table resolving ambiguity in
+            cases C16 and C19 of the DMC configurations.
+        tet_table (torch.Tensor): Lookup table used in
+            tetrahedralizing the isosurface.
+        quad_split_1 (torch.Tensor): Indices for splitting a quad
+            into two triangles along one diagonal.
+        quad_split_2 (torch.Tensor): Alternative indices for
+            splitting a quad into two triangles along the other
+            diagonal.
+        quad_split_train (torch.Tensor): Indices for splitting a
+            quad into four triangles during training by connecting
+            all edges to their midpoints.
+        cube_corners (torch.Tensor): Defines the positions of a
+            standard unit cube's eight corners in 3D space, ordered
+            starting from the origin (0,0,0), moving along the
+            x-axis, then y-axis, and finally z-axis. Used as a
+            blueprint for generating a voxel grid.
+        cube_corners_idx (torch.Tensor): Cube corners indexed as
+            powers of 2, used to retrieve the case id.
+        cube_edges (torch.Tensor): Edge connections in a cube,
+            listed in pairs. Used to retrieve edge vertices in DMC.
+        edge_dir_table (torch.Tensor): A mapping tensor that
+            associates edge indices with their corresponding axis.
+            For instance, edge_dir_table[0] = 0 indicates that the
             first edge is oriented along the x-axis.
-        dir_faces_table (torch.Tensor): A tensor that maps the corresponding axis of shared edges
-            across four adjacent cubes to the shared faces of these cubes. For instance,
-            dir_faces_table[0] = [5, 4] implies that for four cubes sharing an edge along
-            the x-axis, the first and second cubes share faces indexed as 5 and 4, respectively.
-            This tensor is only utilized during isosurface tetrahedralization.
+        dir_faces_table (torch.Tensor): A tensor that maps the
+            corresponding axis of shared edges across four adjacent
+            cubes to the shared faces of these cubes. For instance,
+            dir_faces_table[0] = [5, 4] implies that for four cubes
+            sharing an edge along the x-axis, the first and second
+            cubes share faces indexed as 5 and 4, respectively.
+            This tensor is only utilized during isosurface
+            tetrahedralization.
         adj_pairs (torch.Tensor):
-            A tensor containing index pairs that correspond to neighboring cubes that share the same edge.
+            A tensor containing index pairs that correspond to
+            neighboring cubes that share the same edge.
         qef_reg_scale (float):
-            The scaling factor applied to the regularization loss to prevent issues with singularity
-            when solving the QEF. This parameter is only used when a 'grad_func' is specified.
+            The scaling factor applied to the regularization loss to
+            prevent issues with singularity when solving the QEF.
+            This parameter is only used when a 'grad_func' is
+            specified.
         weight_scale (float):
-            The scale of weights in DeepSDFStruct.flexicubes. Should be between 0 and 1.
+            The scale of weights in flexicubes. Should be between
+            0 and 1.
     """
 
     def __init__(self, device="cuda", qef_reg_scale=1e-3, weight_scale=0.99):
@@ -202,14 +239,22 @@ class FlexiCubes:
             + 0.5 * (bounds[1] - bounds[0])
             + (bounds[1] - bounds[0]) * samples
         )
-        tolerance = 1e-6
-        torch._assert(
-            torch.all(
-                verts_scaled.ge(bounds[0] - tolerance)
-                & verts_scaled.le(bounds[1] + tolerance)
-            ),
-            "Samples are out of specified bounds",
+        bounds_range = bounds[1] - bounds[0]
+        tolerance = torch.maximum(
+            torch.tensor(1e-6, device=bounds.device), 1e-6 * bounds_range.max()
         )
+        below = verts_scaled < bounds[0] - tolerance
+        above = verts_scaled > bounds[1] + tolerance
+        if below.any() or above.any():
+            violations = below | above
+            num_violations = violations.sum().item()
+            max_violation = torch.maximum(
+                (bounds[0] - verts_scaled).max(), (verts_scaled - bounds[1]).max()
+            ).item()
+            warnings.warn(
+                f"{num_violations} samples are out of specified bounds by max {max_violation:.6e}. "
+                f"Bounds: [{bounds[0].tolist()}, {bounds[1].tolist()}]"
+            )
         return verts_scaled, cubes
 
     # changes mkofler: adapted function signature to match the kaolin package
@@ -234,29 +279,39 @@ class FlexiCubes:
         n_smoothing_iterations=5,
     ):
         r"""
-        Main function for mesh extraction from scalar field using DeepSDFStruct.flexicubes. This function converts
-        discrete signed distance fields, encoded on voxel grids and additional per-cube parameters,
-        to triangle or tetrahedral meshes using a differentiable operation as described in
-        `Flexible Isosurface Extraction for Gradient-Based Mesh Optimization`_. DeepSDFStruct.flexicubes enhances
-        mesh quality and geometric fidelity by adjusting the surface representation based on gradient
-        optimization. The output surface is differentiable with respect to the input vertex positions,
-        scalar field values, and weight parameters.
+        Main function for mesh extraction from scalar field using
+        flexicubes. This function converts discrete signed distance
+        fields, encoded on voxel grids and additional per-cube
+        parameters, to triangle or tetrahedral meshes using a
+        differentiable operation as described in `Flexible Isosurface
+        Extraction for Gradient-Based Mesh Optimization`_. Flexicubes
+        enhances mesh quality and geometric fidelity by adjusting the
+        surface representation based on gradient optimization. The
+        output surface is differentiable with respect to the input
+        vertex positions, scalar field values, and weight parameters.
 
-        If you intend to extract a surface mesh from a fixed Signed Distance Field without the
-        optimization of parameters, it is suggested to provide the "grad_func" which should
-        return the surface gradient at any given 3D position. When grad_func is provided, the process
-        to determine the dual vertex position adapts to solve a Quadratic Error Function (QEF), as
-        described in the `Manifold Dual Contouring`_ paper, and employs an smart splitting strategy.
-        Please note, this approach is non-differentiable.
+        If you intend to extract a surface mesh from a fixed Signed
+        Distance Field without the optimization of parameters, it is
+        suggested to provide the "grad_func" which should return the
+        surface gradient at any given 3D position. When grad_func is
+        provided, the process to determine the dual vertex position
+        adapts to solve a Quadratic Error Function (QEF), as
+        described in the `Manifold Dual Contouring`_ paper, and
+        employs a smart splitting strategy. Please note, this
+        approach is non-differentiable.
 
-        For more details and example usage in optimization, refer to the
-        `Flexible Isosurface Extraction for Gradient-Based Mesh Optimization`_ SIGGRAPH 2023 paper.
+        For more details and example usage in optimization, refer to
+        the `Flexible Isosurface Extraction for Gradient-Based Mesh
+        Optimization`_ SIGGRAPH 2023 paper.
 
         Args:
-            x_nx3 (torch.Tensor): Coordinates of the voxel grid vertices, can be deformed.
-            s_n (torch.Tensor): Scalar field values at each vertex of the voxel grid. Negative values
-                denote that the corresponding vertex resides inside the isosurface. This affects
-                the directions of the extracted triangle faces and volume to be tetrahedralized.
+            x_nx3 (torch.Tensor): Coordinates of the voxel grid
+                vertices, can be deformed.
+            s_n (torch.Tensor): Scalar field values at each vertex
+                of the voxel grid. Negative values denote that the
+                corresponding vertex resides inside the isosurface.
+                This affects the directions of the extracted triangle
+                faces and volume to be tetrahedralized.
             cube_fx8 (torch.Tensor): Indices of 8 vertices for each cube in the voxel grid.
             res (int or list[int]): The resolution of the voxel grid. If an integer is provided, it
                 is used for all three dimensions. If a list or tuple of 3 integers is provided, they
@@ -951,4 +1006,57 @@ class FlexiCubes:
 
         tets = torch.cat([tets_surface, tets_inside])
         vertices = torch.cat([vertices, inside_verts, inside_cubes_center])
+        # The surface (pyramid) and interior sub-procedures above emit tets
+        # with inconsistent winding, so a large fraction come out inverted
+        # (negative signed volume). FEA solvers require a positive signed
+        # volume / Jacobian, so normalize every tet to positive orientation
+        # and drop degenerate (zero-volume) elements.
+        tets = self._orient_tets(vertices, tets)
         return vertices, tets
+
+    @staticmethod
+    def _orient_tets(vertices, tets, threshold_factor=1e-5):
+        """Return ``tets`` with a consistent, strictly positive signed volume.
+
+        For a tetrahedron with vertices ``(v0, v1, v2, v3)`` the signed volume
+        is proportional to ``det([v1 - v0, v2 - v0, v3 - v0])``. Elements with
+        a negative determinant are inverted; swapping the last two vertices
+        flips the orientation so the signed volume becomes positive without
+        changing the element's geometry. The vertex indices are merely
+        reordered, so gradients to ``vertices`` are unaffected.
+
+        Degenerate elements (four coplanar vertices, zero volume) cannot be
+        repaired by reordering and are removed instead. Vertices are left
+        untouched, so indices of the remaining tets stay valid.
+
+        Args:
+            vertices (torch.Tensor): All vertices as coordinates
+            tets (torch.Tensor): Indices of vertices that form tets
+            threshold_factor (float, optional): Maximum element volume
+                up until the elements get removed. Gets multiplied by
+                the Hadamard bound |e1||e2||e3|.
+        """
+        if tets.shape[0] == 0:
+            return tets
+        # Only integer index masks are derived here, so skip autograd
+        # recording even when ``vertices`` requires gradients.
+        with torch.no_grad():
+            v0 = vertices[tets[:, 0]]
+            v1 = vertices[tets[:, 1]]
+            v2 = vertices[tets[:, 2]]
+            v3 = vertices[tets[:, 3]]
+            e1, e2, e3 = v1 - v0, v2 - v0, v3 - v0
+            signed_vol = torch.einsum("ij,ij->i", e1, torch.linalg.cross(e2, e3, dim=1))
+            inverted = signed_vol < 0
+            # Coplanar tets only evaluate to exactly zero up to floating-point
+            # rounding (which depends on the association order of the triple
+            # product), so compare against a tolerance relative to the Hadamard
+            # bound |e1||e2||e3| of the determinant instead of zero itself.
+            scale = e1.norm(dim=1) * e2.norm(dim=1) * e3.norm(dim=1)
+            degenerate = signed_vol.abs() <= threshold_factor * scale
+        tets = tets.clone()
+        tets[inverted] = tets[inverted][:, [0, 1, 3, 2]]
+        if degenerate.any():
+            logger.info(f"removed {int(degenerate.sum())} elements with 0 volume")
+            tets = tets[~degenerate]
+        return tets

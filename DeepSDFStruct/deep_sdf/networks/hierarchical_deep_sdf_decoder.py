@@ -1,21 +1,36 @@
+"""
+Hierarchical DeepSDF Decoder Network
+====================================
+
+This module implements a hierarchical decoder architecture that injects
+latent codes at multiple layers rather than only at the input. This enables
+multi-scale geometric control and better representation of complex features.
+
+Architecture
+------------
+Unlike the standard DeepSDF decoder, this architecture:
+- Accepts multiple latent vectors of potentially different sizes
+- Injects each latent at a specified layer depth
+- Enables hierarchical control from coarse to fine details
+- Supports various activation functions (ReLU, GELU, SiLU, etc.)
+
+The hierarchical structure is particularly useful for:
+- Multi-resolution geometric features
+- Compositional shape generation
+- Transfer learning across scales
+- Fine-tuning specific detail levels
+
+This architecture is inspired by progressive training and multi-scale
+representations in generative models.
+"""
+
 #!/usr/bin/env python3
 # Copyright 2004-present Facebook. All Rights Reserved.
 
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
-
-activations = {
-    "relu": nn.ReLU(),
-    "tanh": nn.Tanh(),
-    "gelu": nn.GELU(),
-    "silu": nn.SiLU(),
-    "leaky_relu": nn.LeakyReLU(),
-    "elu": nn.ELU(),
-    "selu": nn.SELU(),
-    "sigmoid": nn.Sigmoid(),
-    "softplus": nn.Softplus(),
-}
+from DeepSDFStruct.deep_sdf.nn_utils import activations
 
 
 class HierachicalDeepSDFDecoder(nn.Module):

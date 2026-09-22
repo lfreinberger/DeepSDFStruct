@@ -4,55 +4,71 @@ from DeepSDFStruct.deep_sdf.training import (
     create_interpolated_meshes_from_latent,
 )
 from DeepSDFStruct.pretrained_models import get_model
-from huggingface_hub import snapshot_download
+from _hf_helpers import snapshot_download_with_retry
+import pytest
 import torch
 
+REVISION = "dbe58ebaa00057d5f15096c2b253c7efa91e19d3"
 
-def test_train_hierarchical_model():
-    data_dir = snapshot_download(
+
+@pytest.fixture(scope="module", autouse=True)
+def set_float32_dtype():
+    torch.set_default_dtype(torch.float32)
+    torch.set_default_device("cpu")
+    yield
+
+
+@pytest.fixture(scope="module")
+def data_dir():
+    return snapshot_download_with_retry(
         "mkofler/lattice_structure_unit_cells",
         repo_type="dataset",
-        revision="b80339abc071df77ff81e8abc19ad4856d96ddbd",
+        revision=REVISION,
+        ignore_patterns=["*.stl", "**/*.stl"],
     )
+
+
+def test_train_homogenization_model(data_dir):
+    exp_dir = "DeepSDFStruct/trained_models/test_experiment_homogenization"
+
+    device = "cpu"
+    train_deep_sdf(exp_dir, data_dir, device=device)
+
+
+def test_train_hierarchical_model(data_dir):
     exp_dir = "DeepSDFStruct/trained_models/test_experiment_hierarchical"
 
     device = "cpu"
-    torch.set_default_device("cpu")
     train_deep_sdf(exp_dir, data_dir, device=device)
 
 
-def test_train_model():
-    data_dir = snapshot_download(
-        "mkofler/lattice_structure_unit_cells",
-        repo_type="dataset",
-        revision="b80339abc071df77ff81e8abc19ad4856d96ddbd",
-    )
+def test_train_model(data_dir):
     exp_dir = "DeepSDFStruct/trained_models/test_experiment"
 
     device = "cpu"
-    torch.set_default_device("cpu")
     train_deep_sdf(exp_dir, data_dir, device=device)
 
 
-def test_continue_from():
-    data_dir = snapshot_download(
-        "mkofler/lattice_structure_unit_cells",
-        repo_type="dataset",
-        revision="b80339abc071df77ff81e8abc19ad4856d96ddbd",
-    )
+def test_continue_from(data_dir):
     exp_dir = "DeepSDFStruct/trained_models/test_experiment"
 
     device = "cpu"
-    torch.set_default_device("cpu")
     train_deep_sdf(exp_dir, data_dir, device=device, continue_from="1")
 
 
 def test_latent_recon():
+    # Each reconstruction is one marching-cubes extraction over a 31**3 grid,
+    # so this covers the two code paths with the smallest input that exercises
+    # them: 2 latent vectors, and 1 interpolation pair at its 2 endpoints.
+    # Reconstructing all 20 latents and 8 interpolation steps took ~28
+    # extractions, which dominated the suite on a 2-core CI runner.
     exp_dir = "DeepSDFStruct/trained_models/analytic_round_cross"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = "cpu"
-    reconstruct_meshs_from_latent(exp_dir, filetype="obj", device=device)
-    create_interpolated_meshes_from_latent(exp_dir, [1, 2, 3], 4, device=device)
+    reconstruct_meshs_from_latent(
+        exp_dir, filetype="obj", device=device, indices=[0, 1]
+    )
+    create_interpolated_meshes_from_latent(exp_dir, [1, 2], 2, device=device)
 
 
 def test_cpp_file_export():
@@ -65,8 +81,17 @@ if __name__ == "__main__":
     import warnings
 
     warnings.filterwarnings("error")
-    test_train_hierarchical_model()
-    test_train_model()
-    test_continue_from()
+    torch.set_default_dtype(torch.float32)
+    torch.set_default_device("cpu")
+    data_dir = snapshot_download_with_retry(
+        "mkofler/lattice_structure_unit_cells",
+        repo_type="dataset",
+        revision=REVISION,
+        ignore_patterns=["*.stl", "**/*.stl"],
+    )
+    test_train_homogenization_model(data_dir)
+    test_train_hierarchical_model(data_dir)
+    test_train_model(data_dir)
+    test_continue_from(data_dir)
     test_latent_recon()
     test_cpp_file_export()

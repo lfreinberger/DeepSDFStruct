@@ -1,3 +1,46 @@
+"""
+Experiment Workspace Management
+===============================
+
+This module provides utilities for managing DeepSDF experiment workspaces,
+including directory structures, file naming conventions, and model loading/saving.
+
+Constants
+---------
+The module defines standard subdirectory and file names for organizing
+experiment artifacts:
+- Model parameters and checkpoints
+- Optimizer states
+- Latent code vectors
+- Training logs and plots
+- Reconstructions and evaluations
+- Dataset samples and normalization parameters
+
+Architecture Registry
+--------------------
+ARCHITECTURES: dict
+    Maps architecture names to decoder classes, enabling dynamic model
+    instantiation from configuration files.
+
+Functions
+---------
+
+load_experiment_specifications
+    Load experiment configuration from specs.json file.
+
+load_trained_model
+    Load a trained decoder network from checkpoint.
+
+load_latent_vectors
+    Load learned latent codes from checkpoint.
+
+create_experiment_directory
+    Initialize directory structure for a new experiment.
+
+The workspace utilities ensure consistent organization across experiments
+and simplify model loading for inference and continued training.
+"""
+
 #!/usr/bin/env python3
 # Copyright 2004-present Facebook. All Rights Reserved.
 
@@ -10,11 +53,16 @@ from typing import TypedDict
 from .networks.analytic_round_cross import RoundCrossDecoder
 from .networks.deep_sdf_decoder import DeepSDFDecoder
 from .networks.hierarchical_deep_sdf_decoder import HierachicalDeepSDFDecoder
+from .networks.resnet_positional_sdf_decoder import ResNetPositionalDeepSDFDecoder
+from .networks.hierarchical_positional_sdf_decoder import (
+    HierachicalPositionalDeepSDFDecoder,
+)
 
 screenshots_subdir = "Screenshots"
 model_params_subdir = "ModelParameters"
 optimizer_params_subdir = "OptimizerParameters"
 latent_codes_subdir = "LatentCodes"
+latent_code_data_map_filename = "latent_code_data_map.json"
 logs_filename = "Logs.pth"
 logplot_filename = "Logs.png"
 reconstructions_subdir = "Reconstructions"
@@ -34,6 +82,8 @@ ARCHITECTURES = {
     "analytic_round_cross": RoundCrossDecoder,
     "deep_sdf_decoder": DeepSDFDecoder,
     "hierarchical_deep_sdf_decoder": HierachicalDeepSDFDecoder,
+    "resnet_positional_deep_sdf_decoder": ResNetPositionalDeepSDFDecoder,
+    "hierarchical_positional_deep_sdf_decoder": HierachicalPositionalDeepSDFDecoder,
 }
 
 try:
@@ -105,7 +155,7 @@ def load_model_parameters(
 
     data = torch.load(filename, map_location=device, weights_only=True)
 
-    decoder.load_state_dict(data["model_state_dict"])
+    decoder.load_state_dict(data["model_state_dict"], strict=False)
 
     return data["epoch"]
 
@@ -221,6 +271,14 @@ def get_latent_codes_dir(experiment_dir, create_if_nonexistent=False):
     return dir
 
 
+def get_latent_code_data_map_filename(experiment_dir):
+    """Return absolute path for the latent-to-data mapping JSON file."""
+    return os.path.join(
+        get_latent_codes_dir(experiment_dir, create_if_nonexistent=True),
+        latent_code_data_map_filename,
+    )
+
+
 def get_normalization_params_filename(
     data_dir, dataset_name, class_name, instance_name
 ):
@@ -265,14 +323,16 @@ def load_trained_model(
 
     data = torch.load(filename, map_location=device)
     decoder = init_decoder(experiment_specs, device, data_parallel)
-    try:
-        decoder.load_state_dict(data["model_state_dict"])
-    except RuntimeError:
-        state_dict = {}
-        for k, v in data["model_state_dict"].items():
-            new_key = k.replace("module.", "", 1) if k.startswith("module.") else k
-            state_dict[new_key] = v
-        decoder.load_state_dict(state_dict)
+
+    state_dict = data["model_state_dict"]
+    if any(k.startswith("module.") for k in state_dict.keys()):
+        stripped_dict = {}
+        for k, v in state_dict.items():
+            new_key = k.replace("module.", "", 1)
+            stripped_dict[new_key] = v
+        state_dict = stripped_dict
+
+    decoder.load_state_dict(state_dict, strict=False)
     decoder = decoder.to(device)
     return decoder
 

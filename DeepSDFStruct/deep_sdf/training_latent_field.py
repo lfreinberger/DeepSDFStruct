@@ -6,7 +6,6 @@ import sys
 import json
 import math
 import time
-import copy
 import signal
 import random
 import logging
@@ -358,11 +357,12 @@ def train(
         datefmt="%H:%M:%S",
         force=True,
     )
-    logging.debug("running " + experiment_directory)
+    # Normalize before first use: the log line below concatenates it, which
+    # raises TypeError for a PathLike argument.
     experiment_directory = str(experiment_directory)
+    logging.debug("running " + experiment_directory)
     specs = ws.load_experiment_specifications(experiment_directory)
     logging.info("Experiment description: \n" + specs["Description"])
-    run_ctx = None
     use_mlflow = bool(use_mlflow) and (mlflow.active_run() is not None)
     if use_mlflow:
         if mlflow_tags:
@@ -652,9 +652,7 @@ def train(
         # Normalize checkpoint name: ws functions expect name without .pth,
         # local save/load functions expect the full filename.
         ckpt_filename = (
-            continue_from
-            if continue_from.endswith(".pth")
-            else continue_from + ".pth"
+            continue_from if continue_from.endswith(".pth") else continue_from + ".pth"
         )
         ckpt_label = ckpt_filename[:-4]
 
@@ -678,22 +676,11 @@ def train(
             pass
 
         try:
-            (
-                loss_log,
-                lr_log,
-                timing_log,
-                lat_mag_log,
-                param_mag_log,
-                log_epoch,
-            ) = load_logs(experiment_directory)
+            loss_log, lr_log, timing_log, lat_mag_log, param_mag_log, log_epoch = (
+                load_logs(experiment_directory)
+            )
             if log_epoch != model_epoch:
-                (
-                    loss_log,
-                    lr_log,
-                    timing_log,
-                    lat_mag_log,
-                    param_mag_log,
-                ) = clip_logs(
+                loss_log, lr_log, timing_log, lat_mag_log, param_mag_log = clip_logs(
                     loss_log,
                     lr_log,
                     timing_log,
@@ -720,6 +707,12 @@ def train(
     global_step = 0
     error = 0.0
     total_time = "0:00:00"
+    # The loop body never runs when resuming a run that already reached
+    # NumEpochs, and the summary below reads `epoch`. Seed it with the last
+    # completed epoch so that case returns a summary instead of raising
+    # UnboundLocalError (`error` and `total_time` above are pre-set for the
+    # same reason).
+    epoch = start_epoch - 1
     for epoch in range(start_epoch, num_epochs + 1):
         start = time.time()
         adjust_learning_rate(epoch)
@@ -818,9 +811,7 @@ def train(
                             )
                             pred_eik = structs[sid_int](xyz_eik)
                             grad_sdf = torch.autograd.grad(
-                                pred_eik.sum(),
-                                xyz_eik,
-                                create_graph=True,
+                                pred_eik.sum(), xyz_eik, create_graph=True
                             )[0]
                             eik_sq_residuals.append((grad_sdf.norm(dim=-1) - 1) ** 2)
                         eikonal_loss = torch.cat(eik_sq_residuals).mean()

@@ -92,14 +92,18 @@ def get_mesh_from_torchfem(Solid: torchfem.Solid) -> pyvista.UnstructuredGrid:
     if not isinstance(Solid, torchfem.Solid):
         raise NotImplementedError("Currently only solid mesh is supported.")
     # VTK cell types
-    if isinstance(Solid.etype, Tetra1):
-        cell_types = Solid.n_elem * [pyvista.CellType.TETRA]
-    elif isinstance(Solid.etype, Tetra2):
-        cell_types = Solid.n_elem * [pyvista.CellType.QUADRATIC_TETRA]
-    elif isinstance(Solid.etype, Hexa1):
-        cell_types = Solid.n_elem * [pyvista.CellType.HEXAHEDRON]
-    elif isinstance(Solid.etype, Hexa2):
-        cell_types = Solid.n_elem * [pyvista.CellType.QUADRATIC_HEXAHEDRON]
+    etype = Solid.etype
+
+    if etype is Tetra1 or isinstance(etype, Tetra1):
+        cell_types = [pyvista.CellType.TETRA] * Solid.n_elem
+    elif etype is Tetra2 or isinstance(etype, Tetra2):
+        cell_types = [pyvista.CellType.QUADRATIC_TETRA] * Solid.n_elem
+    elif etype is Hexa1 or isinstance(etype, Hexa1):
+        cell_types = [pyvista.CellType.HEXAHEDRON] * Solid.n_elem
+    elif etype is Hexa2 or isinstance(etype, Hexa2):
+        cell_types = [pyvista.CellType.QUADRATIC_HEXAHEDRON] * Solid.n_elem
+    else:
+        raise TypeError(f"Unsupported element type: {etype} ({type(etype)})")
 
     # VTK element list
     el = len(Solid.elements[0]) * torch.ones(Solid.n_elem, dtype=Solid.elements.dtype)
@@ -299,10 +303,15 @@ class MMA:
         """Per-row constraint scales (m, 1): ``|G_scale[i]|``, or 1 for None/0 entries."""
         if G_scale is None:
             return np.ones((self.m, 1))
-        vals = np.atleast_1d(np.asarray(
-            [0.0 if v is None else float(v) for v in np.atleast_1d(np.asarray(G_scale, dtype=object))],
-            dtype=float,
-        )).reshape(-1)
+        vals = np.atleast_1d(
+            np.asarray(
+                [
+                    0.0 if v is None else float(v)
+                    for v in np.atleast_1d(np.asarray(G_scale, dtype=object))
+                ],
+                dtype=float,
+            )
+        ).reshape(-1)
         if vals.size != self.m:
             raise ValueError(f"G_scale has {vals.size} entries, expected {self.m} rows")
         scale = np.abs(vals)
@@ -322,7 +331,11 @@ class MMA:
         cannot reduce the worst violation (evaluation-noise floor) -- the residual is
         logged either way.
         """
-        lim = float(step_limit) if step_limit is not None else float(self.max_step_initial)
+        lim = (
+            float(step_limit)
+            if step_limit is not None
+            else float(self.max_step_initial)
+        )
         lo, hi = self.bounds[:, 0:1], self.bounds[:, 1:2]
         g, J = restore_eval(x)
         g = np.asarray(g, dtype=float).reshape(-1)
@@ -339,7 +352,9 @@ class MMA:
             # Least-norm correction onto g = 0 (strictly inside the tol-acceptance):
             # dx = Jv^T (Jv Jv^T)^-1 (-gv), tiny Tikhonov guard for degenerate rows.
             A = Jv @ Jv.T
-            A += (1e-10 * max(float(np.trace(A)) / max(gv.size, 1), 0.0) + 1e-30) * np.eye(gv.size)
+            A += (
+                1e-10 * max(float(np.trace(A)) / max(gv.size, 1), 0.0) + 1e-30
+            ) * np.eye(gv.size)
             dx = (Jv.T @ np.linalg.solve(A, -gv)).reshape(-1, 1)
             nrm = float(np.abs(dx).max())
             if nrm <= 0.0:
@@ -376,9 +391,22 @@ class MMA:
             )
         return x
 
-    def step(self, F, dF, G, dG, G_scale=None, geom_eval=None, geom_rows=None,
-             max_inner=1, feas_tol=0.05, restore_eval=None, restore_tol=5e-3,
-             restore_max_steps=8, restore_step_limit=None):
+    def step(
+        self,
+        F,
+        dF,
+        G,
+        dG,
+        G_scale=None,
+        geom_eval=None,
+        geom_rows=None,
+        max_inner=1,
+        feas_tol=0.05,
+        restore_eval=None,
+        restore_tol=5e-3,
+        restore_max_steps=8,
+        restore_step_limit=None,
+    ):
         """Perform one MMA optimization step.
 
         Updates design variables by solving a convex subproblem constructed
@@ -391,10 +419,13 @@ class MMA:
         dF : torch.Tensor
             Gradient of objective w.r.t. design variables, shape (n,).
         G : torch.Tensor or float
-            RAW constraint rows ``value - target`` at the current design, shape
-            (m,) (≤ 0 is feasible). Do not pre-scale; see ``G_scale``.
+            RAW constraint rows ``value - target`` at the current design (≤ 0 is
+            feasible), reshaped to (m, 1) for the ``m = n_constraints`` rows this
+            instance was built with. A scalar is accepted when ``m == 1``. Do not
+            pre-scale; see ``G_scale``.
         dG : torch.Tensor
-            RAW gradients of the constraint rows w.r.t. design variables, shape (m, n).
+            RAW gradients of the constraint rows w.r.t. design variables, reshaped
+            to (m, n). For ``m == 1`` a flat (n,) tensor is accepted.
         G_scale : sequence of float or None, optional
             Per-row reference scale, normally the row's TARGET value: row ``i`` (value
             and gradient) is divided by ``|G_scale[i]|`` so the subproblem sees the
@@ -471,17 +502,23 @@ class MMA:
         # (see the class docstring). Objective by |F(x_0)| (abs: a negative initial
         # value must not flip the descent direction); rows by |G_scale|.
         if self.loop == 0:
-            F0 = abs(float(F_np[0, 0]))
-            if not np.isfinite(F0) or F0 == 0.0:
+            # Normalize by the MAGNITUDE of the initial objective. Dividing by a
+            # signed F0 flips the sign of both F and dF whenever F(x0) < 0, which
+            # turns the minimization into a maximization: the same problem with a
+            # constant added to the objective (which cannot move the optimum) then
+            # converges to a different point. A zero or non-finite F(x0) cannot
+            # serve as a scale, so fall back to 1.0 and leave the objective unscaled.
+            f0_mag = float(np.abs(F_np[0, 0]))
+            if not np.isfinite(f0_mag) or f0_mag == 0.0:
                 logger.warning(
                     f"MMA: initial objective {F_np[0, 0]!r} unusable as scale, using 1.0"
                 )
-                F0 = 1.0
-            self.F0 = F0
+                f0_mag = 1.0
+            self.F0 = np.full((1, 1), f0_mag)
         self.G_scale = self._row_scales(G_scale)
         if self.loop == 0:
             logger.info(
-                f"MMA scaling: objective / {self.F0:.3e}, constraint rows / "
+                f"MMA scaling: objective / {float(self.F0[0, 0]):.3e}, constraint rows / "
                 f"{self.G_scale.reshape(-1).tolist()}"
             )
 
@@ -496,7 +533,10 @@ class MMA:
             _geom_scale = self.G_scale.reshape(-1)[list(geom_rows)]
 
             def geom_eval(x_np):
-                return np.asarray(_geom_eval_raw(x_np), dtype=float).reshape(-1) / _geom_scale
+                return (
+                    np.asarray(_geom_eval_raw(x_np), dtype=float).reshape(-1)
+                    / _geom_scale
+                )
 
         if restore_eval is not None:
             _restore_raw = restore_eval
@@ -534,7 +574,7 @@ class MMA:
         do_inner = (
             geom_eval is not None and geom_rows is not None and len(geom_rows) > 0
         )
-        pred_slack = 1e-6     # slack on "worse than the model" (rows are O(1) normalized)
+        pred_slack = 1e-6  # slack on "worse than the model" (rows are O(1) normalized)
 
         self.loop += 1
         xmin = np.maximum(self.x - float(self.max_step), self.bounds[:, 0:1])
@@ -573,18 +613,45 @@ class MMA:
             # initialization of raa0 (objective) / raa (constraint rows) from the
             # current gradients. The raa0/raa inputs are overwritten, so pass dummies.
             low, upp, raa0, raa = asymp(
-                self.loop, self.n, self.x, self.xold1, self.xold2, xmin, xmax,
-                self.low, self.upp, raa0eps, np.full((self.m, 1), raaeps[0, 0]),
-                raa0eps, raaeps, dFdx_np, dGdx_np,
+                self.loop,
+                self.n,
+                self.x,
+                self.xold1,
+                self.xold2,
+                xmin,
+                xmax,
+                self.low,
+                self.upp,
+                raa0eps,
+                np.full((self.m, 1), raaeps[0, 0]),
+                raa0eps,
+                raaeps,
+                dFdx_np,
+                dGdx_np,
             )
             g_now = G_np[rows, 0]
             best_x, best_score = None, np.inf
             for inner in range(n_inner):
-                (xmma, ymma, zmma, lam, xsi, eta, muMMA, zet, s,
-                 f0app, fapp) = gcmmasub(
-                    self.m, self.n, self.loop, epsimin, self.x, xmin, xmax,
-                    low, upp, raa0, raa, F_np, dFdx_np, G_np, dGdx_np,
-                    self.a0_MMA, self.a_MMA, self.c_MMA, self.d_MMA,
+                xmma, ymma, zmma, lam, xsi, eta, muMMA, zet, s, f0app, fapp = gcmmasub(
+                    self.m,
+                    self.n,
+                    self.loop,
+                    epsimin,
+                    self.x,
+                    xmin,
+                    xmax,
+                    low,
+                    upp,
+                    raa0,
+                    raa,
+                    F_np,
+                    dFdx_np,
+                    G_np,
+                    dGdx_np,
+                    self.a0_MMA,
+                    self.a_MMA,
+                    self.c_MMA,
+                    self.d_MMA,
                 )
                 # True (nonlinear) geometry values at the candidate (g = value - target,
                 # > 0 infeasible) vs the conservative approximation at the same point
@@ -629,11 +696,21 @@ class MMA:
                 fvalnew = np.asarray(fapp, dtype=float).reshape(self.m, 1).copy()
                 fvalnew[rows, 0] = g_true
                 raa0, raa = raaupdate(
-                    xmma, self.x, xmin, xmax, low, upp,
-                    np.asarray(f0app, dtype=float).reshape(1, 1), fvalnew,
+                    xmma,
+                    self.x,
+                    xmin,
+                    xmax,
+                    low,
+                    upp,
+                    np.asarray(f0app, dtype=float).reshape(1, 1),
+                    fvalnew,
                     np.asarray(f0app, dtype=float).reshape(1, 1),
                     np.asarray(fapp, dtype=float).reshape(self.m, 1),
-                    raa0, raa, raa0eps, raaeps, epsimin,
+                    raa0,
+                    raa,
+                    raa0eps,
+                    raaeps,
+                    epsimin,
                 )
             xmma = best_x
 
@@ -643,8 +720,11 @@ class MMA:
         # set before committing it as the new design.
         if restore_eval is not None:
             xmma = self._restore_feasibility(
-                xmma, restore_eval, float(restore_tol),
-                restore_max_steps, restore_step_limit,
+                xmma,
+                restore_eval,
+                float(restore_tol),
+                restore_max_steps,
+                restore_step_limit,
             )
 
         # Stationarity (KKT) residual at the CURRENT point x_k, in the scaled units the

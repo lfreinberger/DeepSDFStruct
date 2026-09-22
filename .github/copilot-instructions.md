@@ -1,5 +1,9 @@
 # Project Guidelines
 
+## Lock files
+
+Never modify or touch lock files (e.g., `uv.lock`, `package-lock.json`, `poetry.lock`). These files are managed by their respective package managers and should not be edited manually or as part of automated changes.
+
 ## Build and Test
 - Install dependencies (preferred): `uv sync`
 - Run tests (CI): `uv run pytest --cov=DeepSDFStruct --cov-report=term-missing --cov-report=xml tests`
@@ -24,7 +28,8 @@
   - `DeepSDFStruct/deep_sdf/`: DeepSDF training/reconstruction + metrics.
 
 ## Conventions
-- Prefer `uv` workflows: this repo uses git-sourced dependencies (e.g. `splinepy`, `gustaf`) configured in `pyproject.toml`.
+- Prefer `uv` workflows; all dependencies (including `splinepy` and `gustaf`) resolve from
+  PyPI releases declared in `pyproject.toml`.
 - Device/dtype hygiene:
   - Create new tensors on the SDF’s device/dtype (use `sdf.get_device()` / `sdf.get_dtype()` patterns where available).
   - Keep GPU tensors out of NumPy/mesh IO code paths; detach and move to CPU only at boundaries.

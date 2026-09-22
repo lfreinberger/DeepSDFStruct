@@ -23,7 +23,6 @@ Key Features
 """
 
 import logging
-import warnings
 
 
 import numpy as _np
@@ -140,7 +139,9 @@ class LatticeSDFStruct(_SDFBase):
           near their planes and |grad phi| loses its along-axis component there.
         """
         if tiling_map not in TILING_MAPS:
-            raise ValueError(f"tiling_map must be one of {TILING_MAPS}, got {tiling_map!r}")
+            raise ValueError(
+                f"tiling_map must be one of {TILING_MAPS}, got {tiling_map!r}"
+            )
         self.tiling_map = tiling_map
         if not isinstance(parametrization, _torch.nn.Module):
             raise TypeError("Parametrization must be of type _Parametrization")
@@ -220,7 +221,9 @@ class LatticeSDFStruct(_SDFBase):
         queries_transformed = _torch.zeros_like(inside_samples)
         for i_dim, t in enumerate(self.tiling):
             queries_transformed[:, i_dim] = transform(
-                inside_samples[:, i_dim], t, bounds=bounds[:, i_dim],
+                inside_samples[:, i_dim],
+                t,
+                bounds=bounds[:, i_dim],
                 tiling_map=self.tiling_map,
             )
 
@@ -269,23 +272,6 @@ class LatticeSDFStruct(_SDFBase):
         gus_faces = gus.Faces(vertices=verts.cpu().detach(), faces=faces.cpu().detach())
         gus.show(gus_faces, axes=1)
 
-    def plot_slice(self, deformation_function=None, *args, **kwargs):
-        if deformation_function is not None:
-            xmin = deformation_function.control_points[:, 0].min().item()
-            xmax = deformation_function.control_points[:, 0].max().item()
-            ymin = deformation_function.control_points[:, 1].min().item()
-            ymax = deformation_function.control_points[:, 1].max().item()
-        else:
-            xmin = self.bounds[0, 0].item()
-            xmax = self.bounds[1, 0].item()
-            ymin = self.bounds[0, 1].item()
-            ymax = self.bounds[1, 1].item()
-
-        kwargs.setdefault("xlim", (xmin, xmax))
-        kwargs.setdefault("ylim", (ymin, ymax))
-
-        return super().plot_slice(*args, **kwargs)
-
 
 def constantLatvec(value):
     return _BSpline([0, 0, 0], [[-1, 1], [-1, 1], [-1, 1]], [value])
@@ -311,7 +297,9 @@ def transform(x, t, bounds=[0, 1], tiling_map="hat"):
     """
     x_norm = (x - bounds[0]) / (bounds[1] - bounds[0])
     if tiling_map == "hat":
-        x_transformed = 2 * _torch.abs(t * x_norm / 2 - _torch.floor((t * x_norm + 1) / 2))
+        x_transformed = 2 * _torch.abs(
+            t * x_norm / 2 - _torch.floor((t * x_norm + 1) / 2)
+        )
         return 2 * x_transformed - 1
     if tiling_map == "cosine":
         return -_torch.cos(_torch.pi * t * x_norm)

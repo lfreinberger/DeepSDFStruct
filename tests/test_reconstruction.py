@@ -1,10 +1,19 @@
-"""Reconstruct the feed-channel geometry as a field of local shapes.
+"""Reconstruct a target geometry as a field of local shapes.
 
-Port of the DeepShapeOpt ``experiments/reconstruction/feed_channel`` case onto
-the plain :class:`~DeepSDFStruct.geom_reconstruction.LocalShapesReconstructor`
-API -- same mesh, same hyperparameters, no JSON config and no environment
-variables. The hyperparameters now *are* the library defaults, so only the
-target mesh and the tiling are spelled out here.
+Exercises the plain
+:class:`~DeepSDFStruct.geom_reconstruction.LocalShapesReconstructor` API -- no
+JSON config and no environment variables.
+
+The end-to-end case uses ``tests/data/cone.stl`` at tiling ``[2, 2, 2]``. It was
+ported from the DeepShapeOpt ``experiments/reconstruction/feed_channel`` case,
+which drove ``flow_channel.stl`` at tiling ``[1, 8, 8]``; that is the same code
+path at roughly an order of magnitude more cost, which made it the slowest test
+in CI, so the cheaper target stands in for it here.
+
+These are correctness tests, not a quality benchmark: the epoch count and the
+sample counts are set well below the library defaults so the suite stays quick,
+and the error thresholds are calibrated against those reduced settings. Fit
+quality at the shipped defaults is therefore *not* what is asserted here.
 
 Run as a test::
 
@@ -183,29 +192,40 @@ def test_export_reconstructed_artifacts_writes_files(tmp_path):
     assert built.struct.bounds.dtype == torch.float32
 
 
-
-
 TESTS_DIR = Path(__file__).resolve().parent
-MESH_PATH = TESTS_DIR / "data" / "flow_channel.stl"
-# Overrides the reconstructor's default "output": test artifacts belong in the
-# gitignored tests/tmp_outputs, not in the repository root.
-OUTPUT_DIR = TESTS_DIR / "tmp_outputs" / "feed_channel"
+# The cone is the cheap end-to-end target: 130 vertices and a 6 x 6 x 6 bounding
+# box, against flow_channel.stl's 11k vertices and 10 x 67 x 71. The flow channel
+# at tiling [1, 8, 8] (162 control points) made this the slowest test in CI by a
+# wide margin, and it was covering the same code path as the cone does.
+MESH_PATH = TESTS_DIR / "data" / "cone.stl"
+# A per-test subdirectory of the reconstructor's default tests/tmp_outputs, so
+# this case's artifacts stay separate from the other tests'. Absolute, so the
+# test does not depend on pytest's working directory.
+OUTPUT_DIR = TESTS_DIR / "tmp_outputs" / "cone"
 
-TILING = [1, 8, 8]
-# Below the default of 10 epochs, to keep CI short. Everything else is left at
-# the library default.
+TILING = [2, 2, 2]
+# Below the default of 10 epochs, to keep CI short.
 NUM_ITERATIONS = 3
+# Also below the library defaults (1e5 / 5e5) to keep CI short: sampling 1.1M
+# points dominated this test's runtime at ~65s, against ~7s here.
+N_UNIFORM = 20000
+N_SURFACE = 50000
 # Same resolution recon.export uses, so the metric is taken on the mesh that
 # gets written out.
 MESH_RESOLUTION = 32
 # Mean |SDF| of the target mesh over the reconstructed surface vertices, in the
-# mesh's own units. Three epochs land at ~0.03, the unfitted mean-code
-# initialization at ~6.2, so this catches a fit that stopped working without
-# being tight enough to flag ordinary run-to-run noise.
+# mesh's own units -- so this threshold is tied to the cone's 6 x 6 x 6 box, and
+# has to be recalibrated if MESH_PATH, the epoch count or the sample counts
+# change. Measured on CPU at the settings above: 0.011, against 1.16 for the
+# unfitted mean-code initialization (0.003 at the full 1e5/5e5 sampling, for
+# reference). The threshold sits ~9x above the fit and ~12x below the unfitted
+# baseline: loose enough to absorb the run-to-run noise that the reduced sample
+# counts add across the CI matrix, tight enough to fail a fit that stopped
+# working.
 MAX_SDF_ERROR = 0.1
 
 
-def test_feed_channel_reconstruction():
+def test_cone_reconstruction():
     logging.basicConfig(level=logging.INFO)
 
     recon = LocalShapesReconstructor(
@@ -220,7 +240,11 @@ def test_feed_channel_reconstruction():
     # fit_mesh returns a FitResult; its first four fields unpack directly.
     # Bind the whole thing instead if you also want loss_history / final_loss.
     struct, scaling, gt_sdf, params = recon.fit_mesh(
-        mesh=mesh_orig, tiling=TILING, num_iterations=NUM_ITERATIONS
+        mesh=mesh_orig,
+        tiling=TILING,
+        num_iterations=NUM_ITERATIONS,
+        n_uniform=N_UNIFORM,
+        n_surface=N_SURFACE,
     )
 
     # Degree 1 with n knot spans -> n + 1 control points per dimension.
@@ -240,7 +264,7 @@ def test_feed_channel_reconstruction():
 
     # How far the reconstruction's surface sits from the target surface: mean
     # |SDF of the original mesh| over the reconstructed vertices, in the
-    # original mesh's units (its bounding box is ~10 x 67 x 71).
+    # original mesh's units (its bounding box is 6 x 6 x 6).
     surf_mesh, _ = create_3D_mesh(
         struct,
         MESH_RESOLUTION,
@@ -267,7 +291,7 @@ def test_feed_channel_reconstruction():
 
 
 if __name__ == "__main__":
-    test_feed_channel_reconstruction()
+    test_cone_reconstruction()
     test_fit_mesh_unpacks_and_reduces_error()
     test_fit_samples_reports_diagnostics_and_lowers_loss()
     test_box_constrained_sampling_respects_bounds()

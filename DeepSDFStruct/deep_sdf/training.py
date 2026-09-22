@@ -1,3 +1,56 @@
+"""
+DeepSDF Model Training
+=====================
+
+This module implements the complete training pipeline for DeepSDF neural
+networks. It provides loss functions, learning rate schedules, training
+loops, and checkpoint management.
+
+Key Features
+------------
+
+Loss Functions
+    - ClampedL1Loss: L1 loss with value clamping for stability
+    - Support for custom loss functions
+
+Learning Rate Schedules
+    - ConstantLearningRateSchedule: Fixed learning rate
+    - StepLearningRateSchedule: Step decay schedule
+    - WarmupLearningRateSchedule: Warmup followed by decay
+
+Training Loop
+    - Multi-epoch training with validation
+    - Automatic checkpointing and model saving
+    - Loss tracking and visualization
+    - Support for distributed training
+    - Resume from checkpoint capability
+
+Experiment Management
+    - MLflow integration for experiment tracking
+    - Automatic logging of hyperparameters
+    - Training curve visualization
+    - Model versioning
+
+The training process follows the DeepSDF paper methodology with extensions
+for lattice structures and microstructured materials.
+
+Examples
+--------
+Train a DeepSDF model::
+
+    from DeepSDFStruct.deep_sdf.training import train_deep_sdf
+
+    specs = {
+        'NetworkSpecs': {...},
+        'TrainSpecs': {
+            'NumEpochs': 2000,
+            'LearningRateSchedule': {...}
+        }
+    }
+
+    train_deep_sdf(experiment_dir, specs)
+"""
+
 #!/usr/bin/env python3
 # Copyright 2004-present Facebook. All Rights Reserved.
 
@@ -14,6 +67,7 @@ import datetime
 import random
 import pathlib
 import socket
+import tqdm
 
 import DeepSDFStruct.deep_sdf
 import DeepSDFStruct.deep_sdf.workspace as ws
@@ -22,23 +76,11 @@ from DeepSDFStruct.deep_sdf.models import DeepSDFModel
 from DeepSDFStruct.deep_sdf.plotting import plot_logs
 from DeepSDFStruct.SDF import SDFfromDeepSDF
 from DeepSDFStruct.mesh import create_3D_mesh, export_surface_mesh
+from DeepSDFStruct.deep_sdf.nn_utils import get_loss_function
 from importlib.metadata import version
 import numpy as np
 
 logger = logging.getLogger(DeepSDFStruct.__name__)
-
-
-class ClampedL1Loss(torch.nn.Module):
-    def __init__(self, clamp_val=0.1):
-        super().__init__()
-        self.clamp_val = clamp_val
-        self.loss = torch.nn.L1Loss()
-
-    def forward(self, input, target):
-        # Clamp both input and target to [-clamp_val, clamp_val]
-        input_clamped = input.clamp(-self.clamp_val, self.clamp_val)
-        target_clamped = target.clamp(-self.clamp_val, self.clamp_val)
-        return self.loss(input_clamped, target_clamped)
 
 
 class LearningRateSchedule:
@@ -146,6 +188,38 @@ def save_latent_vectors(experiment_directory, filename, latent_vec, epoch):
     )
 
 
+def save_latent_code_data_map(experiment_directory, data_source, npz_filenames):
+    """Save mapping between latent indices and source training `.npz` files.
+
+    Parameters
+    ----------
+    experiment_directory : str
+        Path to the experiment directory where training artifacts are stored.
+    data_source : str
+        Root directory of the dataset used for training.
+    npz_filenames : list[str]
+        Relative `.npz` paths in dataset split order. The order corresponds
+        directly to latent embedding indices.
+    """
+    latent_code_data_map = {
+        "data_source": data_source,
+        "sdf_samples_subdir": ws.sdf_samples_subdir,
+        "latent_codes": [
+            {
+                "latent_index": latent_idx,
+                "relative_npz_filename": npz_filename,
+                "npz_filename": os.path.join(
+                    data_source, ws.sdf_samples_subdir, npz_filename
+                ),
+            }
+            for latent_idx, npz_filename in enumerate(npz_filenames)
+        ],
+    }
+    filename = ws.get_latent_code_data_map_filename(experiment_directory)
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(latent_code_data_map, f, indent=4)
+
+
 def save_logs(
     experiment_directory,
     loss_log,
@@ -166,11 +240,6 @@ def save_logs(
             "param_magnitude": param_mag_log,
         },
         os.path.join(experiment_directory, ws.logs_filename),
-    )
-    plot_logs(
-        experiment_directory,
-        show_lr=True,
-        filename=os.path.join(experiment_directory, ws.logplot_filename),
     )
 
 
@@ -230,10 +299,6 @@ def append_parameter_magnitudes(param_mag_log, model):
 def train_deep_sdf(
     experiment_directory, data_source, continue_from=None, batch_split=1, device=None
 ):
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S"
-    )
-    logging.debug("running " + experiment_directory)
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -245,8 +310,8 @@ def train_deep_sdf(
         raise RuntimeError("Device must be either cpu or cuda")
 
     specs = ws.load_experiment_specifications(experiment_directory)
-
-    logging.info("Experiment description: \n" + specs["Description"])
+    logger.info(f"Reading experiment configuration from {experiment_directory}")
+    logger.info("Experiment description: \n" + specs["Description"])
 
     # reconstruction_split_file = specs["ReconstructionSplit"]
     # if os.path.isfile(reconstruction_split_file):
@@ -255,7 +320,7 @@ def train_deep_sdf(
     # else:
     #     reconstruction_split = None
 
-    logging.debug(specs["NetworkSpecs"])
+    logger.debug(specs["NetworkSpecs"])
 
     latent_size = specs["CodeLength"]
 
@@ -275,7 +340,7 @@ def train_deep_sdf(
 
     grad_clip = get_spec_with_default(specs, "GradientClipNorm", None)
     if grad_clip is not None:
-        logging.debug("clipping gradients to max norm {}".format(grad_clip))
+        logger.debug("clipping gradients to max norm {}".format(grad_clip))
 
     def save_latest(epoch):
 
@@ -288,9 +353,23 @@ def train_deep_sdf(
         save_model(experiment_directory, str(epoch) + ".pth", decoder, epoch)
         save_optimizer(experiment_directory, str(epoch) + ".pth", optimizer_all, epoch)
         save_latent_vectors(experiment_directory, str(epoch) + ".pth", lat_vecs, epoch)
+        save_logs(
+            experiment_directory,
+            loss_log,
+            lr_log,
+            timing_log,
+            lat_mag_log,
+            param_mag_log,
+            epoch,
+        )
+        plot_logs(
+            experiment_directory,
+            show_lr=True,
+            filename=os.path.join(experiment_directory, ws.logplot_filename),
+        )
 
     def signal_handler(sig, frame):
-        logging.info("Stopping early...")
+        logger.info("Stopping early...")
         sys.exit(0)
 
     def adjust_learning_rate(lr_schedules, optimizer, epoch):
@@ -318,7 +397,6 @@ def train_deep_sdf(
     maxT = clamp_dist
     enforce_minmax = True
 
-    do_code_regularization = get_spec_with_default(specs, "CodeRegularization", True)
     code_reg_lambda = get_spec_with_default(specs, "CodeRegularizationLambda", 1e-4)
 
     code_bound = get_spec_with_default(specs, "CodeBound", None)
@@ -332,10 +410,10 @@ def train_deep_sdf(
 
     geom_dimension = decoder.geom_dimension
     host_name = socket.gethostname()
-    logging.info(f"training on {host_name} with {device_name}")
+    logger.info(f"training on {host_name} with {device_name}")
 
     seed = get_spec_with_default(specs, "seed", 42)
-    logging.info(f"Setting random seed to {seed}")
+    logger.info(f"Setting random seed to {seed}")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -359,25 +437,33 @@ def train_deep_sdf(
         load_ram=True,
         geom_dimension=geom_dimension,
     )
+    save_latent_code_data_map(experiment_directory, data_source, sdf_dataset.npyfiles)
 
     num_data_loader_threads = get_spec_with_default(specs, "DataLoaderThreads", 1)
-    logging.debug("loading data with {} threads".format(num_data_loader_threads))
+    logger.debug("loading data with {} threads".format(num_data_loader_threads))
+
+    # if the batch size is larger than the dataset, we cannot use drop last,
+    # otherwise the dataloader does not load any data
+    if scene_per_batch > len(sdf_dataset):
+        drop_last = False
+    else:
+        drop_last = True
 
     sdf_loader = data_utils.DataLoader(
         sdf_dataset,
         batch_size=scene_per_batch,
         shuffle=True,
         num_workers=num_data_loader_threads,
-        drop_last=True,
+        drop_last=drop_last,
     )
 
-    logging.debug("torch num_threads: {}".format(torch.get_num_threads()))
+    logger.debug("torch num_threads: {}".format(torch.get_num_threads()))
 
     num_scenes = len(sdf_dataset)
 
-    logging.info("There are {} scenes".format(num_scenes))
+    logger.info("There are {} scenes".format(num_scenes))
 
-    logging.debug(decoder)
+    logger.debug(decoder)
     if isinstance(latent_size, list):
         latent_size_embedding = torch.tensor(latent_size).sum()
     else:
@@ -392,15 +478,16 @@ def train_deep_sdf(
         / math.sqrt(latent_size_embedding),
     )
 
-    logging.debug(
+    logger.debug(
         "initialized with mean magnitude {}".format(
             get_mean_latent_vector_magnitude(lat_vecs)
         )
     )
-
-    loss_l1 = torch.nn.L1Loss(reduction="sum")
-    if do_code_regularization == "homogenization":
-        loss_MSE = torch.nn.MSELoss(reduction="mean")
+    loss_fun_spec = get_spec_with_default(specs, "LossFunction", "clampedL1")
+    loss_fun = get_loss_function(loss_fun_spec)
+    add_homogeniation = get_spec_with_default(specs, "AddHomogenization", False)
+    if add_homogeniation:
+        logger.info("adding homogenization loss")
 
     optimizer_all = torch.optim.Adam(
         [
@@ -425,7 +512,7 @@ def train_deep_sdf(
 
     if continue_from is not None:
 
-        logging.info('continuing from "{}"'.format(continue_from))
+        logger.info('continuing from "{}"'.format(continue_from))
 
         _ = ws.load_latent_vectors(experiment_directory, continue_from, device=device)
 
@@ -448,16 +535,16 @@ def train_deep_sdf(
 
         start_epoch = model_epoch + 1
 
-        logging.debug("loaded")
+        logger.debug("loaded")
 
-    logging.info("starting from epoch {}".format(start_epoch))
+    logger.info("starting from epoch {}".format(start_epoch))
 
-    logging.info(
+    logger.info(
         "Number of decoder parameters: {}".format(
             sum(p.data.nelement() for p in decoder.parameters())
         )
     )
-    logging.info(
+    logger.info(
         "Number of shape code parameters: {} (# codes {}, code dim {})".format(
             lat_vecs.num_embeddings * lat_vecs.embedding_dim,
             lat_vecs.num_embeddings,
@@ -465,7 +552,8 @@ def train_deep_sdf(
         )
     )
     start_train = time.time()
-    for epoch in range(start_epoch, num_epochs + 1):
+    pbar = tqdm.trange(start_epoch, num_epochs + 1, desc="Training", smoothing=0)
+    for epoch in pbar:
         epoch_error = 0.0
         start = time.time()
 
@@ -476,7 +564,10 @@ def train_deep_sdf(
         for sdf_data, properties, indices in sdf_loader:
             # Process the input data
             sdf_data = sdf_data.reshape(-1, geom_dimension + 1).to(device)
-            properties = properties.to(device)
+            properties_expanded = properties.reshape(-1, properties.shape[-1]).to(
+                device
+            )
+
             indices = indices.to(device)
 
             num_sdf_samples = sdf_data.shape[0]
@@ -496,13 +587,16 @@ def train_deep_sdf(
             )
 
             sdf_gt = torch.chunk(sdf_gt, batch_split)
+            properties_chunked = torch.chunk(properties_expanded, batch_split)
 
             batch_loss = 0.0
             batch_reg_loss = 0.0
+            batch_hom_loss = 0.0
             optimizer_all.zero_grad()
 
             for i in range(batch_split):
                 batch_lat_vecs = lat_vecs(indices[i])
+                batch_properties = properties_chunked[i]
 
                 input = torch.cat([batch_lat_vecs, xyz[i]], dim=1)
 
@@ -512,25 +606,24 @@ def train_deep_sdf(
                 if enforce_minmax:
                     pred_sdf = torch.clamp(pred_sdf, minT, maxT)
 
-                chunk_loss = loss_l1(pred_sdf, sdf_gt[i].to(device)) / num_sdf_samples
+                chunk_loss = loss_fun(pred_sdf, sdf_gt[i].to(device))
 
-                if do_code_regularization == "homogenization":
-                    unique_lat_vecs = lat_vecs(indices[i].unique())
+                if add_homogeniation:
+                    pred_properties = decoder.predict_C_homogenized(batch_lat_vecs)
 
-                    pred_properties = decoder.module.regressor(
-                        unique_lat_vecs.to(device)
+                    hom_loss = torch.nn.functional.mse_loss(
+                        pred_properties, batch_properties, reduction="mean"
                     )
-                    reg_loss = code_reg_lambda * loss_MSE(
-                        pred_properties, properties.to(device)
-                    )
-                    chunk_loss = chunk_loss + reg_loss.to(device)
-                    batch_reg_loss = batch_reg_loss + reg_loss.to(device)
 
-                l2_size_loss = torch.sum(torch.norm(batch_lat_vecs, dim=1))
+                    chunk_loss += hom_loss.to(device)
+                    batch_hom_loss += hom_loss.item()
+
+                # standard l2 latent vector loss
                 reg_loss = (
-                    code_reg_lambda * min(1, epoch / 100) * l2_size_loss
-                ) / num_sdf_samples
-
+                    code_reg_lambda
+                    * min(1, epoch / 100)
+                    * torch.mean(torch.norm(batch_lat_vecs, dim=1))
+                )
                 chunk_loss = chunk_loss + reg_loss.to(device)
                 batch_reg_loss = batch_reg_loss + reg_loss.to(device)
 
@@ -538,7 +631,7 @@ def train_deep_sdf(
 
                 batch_loss += chunk_loss.item()
 
-            logging.debug("loss = {}".format(batch_loss))
+            logger.debug("loss = {}".format(batch_loss))
 
             loss_log.append(batch_loss)
             grad_clip = 1.0
@@ -552,24 +645,30 @@ def train_deep_sdf(
         error = epoch_error / len(sdf_loader)
 
         end = time.time()
-        # logging.info("epoch {}...".format(epoch))
+        # logger.info("epoch {}...".format(epoch))
         tot_time = time.time() - start_train
         avg_time_per_epoch = tot_time / (epoch)
         estimated_remaining_time = avg_time_per_epoch * (num_epochs - (epoch))
         time_string = str(datetime.timedelta(seconds=round(estimated_remaining_time)))
+
         if epoch == num_epochs:
             total_time = str(datetime.timedelta(seconds=round(tot_time)))
             logging.info(
                 f"Finished {epoch} ({epoch}/{num_epochs}) [{epoch/num_epochs*100:.2f}%] after {total_time}"
             )
         else:
-            logging.info(
-                f"Finished epoch {epoch:5g}/{num_epochs} | "
-                f"with Reg.: {batch_reg_loss:.4f} "
-                f"and Tot.: {batch_loss:.4f} "
-                f"[{epoch/num_epochs*100:.2f}%] in {time_string} "
-                f"({avg_time_per_epoch:.2f}s/epoch)"
-            )
+            if add_homogeniation:
+                pbar.set_postfix(
+                    {
+                        "Loss": f"{batch_loss:.4f}",
+                        "Reg": f"{batch_reg_loss:.4f}",
+                        "Hom": f"{batch_hom_loss:.4f}",
+                    }
+                )
+            else:
+                pbar.set_postfix(
+                    {"Loss": f"{batch_loss:.4f}", "Reg": f"{batch_reg_loss:.4f}"}
+                )
         seconds_elapsed = end - start
         timing_log.append(seconds_elapsed)
 
@@ -583,7 +682,6 @@ def train_deep_sdf(
             save_checkpoints(epoch)
 
         if epoch % log_frequency == 0:
-
             save_latest(epoch)
             save_logs(
                 experiment_directory,
@@ -594,6 +692,7 @@ def train_deep_sdf(
                 param_mag_log,
                 epoch,
             )
+
     summary = ws.ExperimentSummary(
         loss=error,
         num_epochs=epoch,
@@ -614,8 +713,17 @@ def reconstruct_meshs_from_latent(
     max_batch=32,
     filetype="ply",
     device="cpu",
+    indices: list[int] | None = None,
 ):
+    """
+    Reconstruct and export one surface mesh per trained latent vector.
 
+    Args:
+        indices (list[int], optional): Which latent vector indices to
+            reconstruct. Defaults to None, meaning every latent vector in the
+            checkpoint. Each mesh costs one marching-cubes extraction over a
+            31**3 grid, so pass a short list to keep runtimes down.
+    """
     decoder = ws.load_trained_model(experiment_directory, checkpoint, device=device)
     latent_vectors = ws.load_latent_vectors(
         experiment_directory, checkpoint, device=device
@@ -624,7 +732,11 @@ def reconstruct_meshs_from_latent(
     deep_sdf_model = DeepSDFModel(decoder, latent_vectors, device=device)
     sdf_from_DeepSDF = SDFfromDeepSDF(deep_sdf_model)
 
-    for i, latent_in in enumerate(latent_vectors):
+    if indices is None:
+        indices = list(range(len(latent_vectors)))
+
+    for i in indices:
+        latent_in = latent_vectors[i]
         epoch = checkpoint
         dataset = "latent_recon"
         class_name = "all"
@@ -640,7 +752,7 @@ def reconstruct_meshs_from_latent(
         if os.path.isfile(fname):
             print(f"Skipping {fname}")
             continue
-        print(f"Reconstructing {fname} ({i}/{len(latent_vectors)})")
+        print(f"Reconstructing {fname} ({i}/{len(indices)})")
         sdf_from_DeepSDF.set_latent_vec(latent_in)
         surf_mesh, _ = create_3D_mesh(sdf_from_DeepSDF, 30, mesh_type="surface")
         export_surface_mesh(fname, surf_mesh)
@@ -664,16 +776,19 @@ def create_interpolated_meshes_from_latent(
     to disk in the requested format.
 
     Args:
-        experiment_directory (str | PathLike): Path to the experiment directory
-            containing checkpoints and latent vectors.
-        checkpoint (str, optional): Which checkpoint to load. Defaults to "latest".
-        max_batch (int, optional): Maximum batch size for inference. Defaults to 32.
-        filetype (str, optional): File extension for exported meshes (e.g., "ply", "obj").
-            Defaults to "ply".
-        indices (list[int], optional): Sequence of latent vector indices between
-            which interpolation should be performed. Defaults to [1, 2, 3, 4, 5, 6, 7, 8].
-        steps (int, optional): Number of interpolation steps (including endpoints).
-            Defaults to 11.
+        experiment_directory (str | PathLike): Path to the experiment
+            directory containing checkpoints and latent vectors.
+        checkpoint (str, optional): Which checkpoint to load. Defaults to
+            "latest".
+        max_batch (int, optional): Maximum batch size for inference.
+            Defaults to 32.
+        filetype (str, optional): File extension for exported meshes
+            (e.g., "ply", "obj"). Defaults to "ply".
+        indices (list[int], optional): Sequence of latent vector indices
+            between which interpolation should be performed.
+            Defaults to [1, 2, 3, 4, 5, 6, 7, 8].
+        steps (int, optional): Number of interpolation steps (including
+            endpoints). Defaults to 11.
 
     Example:
         >>> create_interpolated_meshes_from_latent(
@@ -725,7 +840,7 @@ def create_interpolated_meshes_from_latent(
             export_surface_mesh(fname, surf_mesh)
 
             # end = time.time()
-            # logging.info("epoch {}...".format(epoch))
+            # logger.info("epoch {}...".format(epoch))
             tot_time = time.time() - start
             avg_time_per_sample = tot_time / (i_sample)
             estimated_remaining_time = avg_time_per_sample * (num_samples - (i_sample))

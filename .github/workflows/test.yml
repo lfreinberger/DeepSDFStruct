@@ -5,13 +5,22 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_call:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+
+    env:
+      HF_HOME: ${{ github.workspace }}/.cache/huggingface
+      HF_HUB_CACHE: ${{ github.workspace }}/.cache/huggingface/hub
+      HF_HUB_DOWNLOAD_TIMEOUT: "60"
+      HF_HUB_ETAG_TIMEOUT: "30"
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
     strategy:
       matrix:
+        os: [ubuntu-latest, macos-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
@@ -28,12 +37,48 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Cache huggingface
+        id: hf-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.cache/huggingface
+          key: huggingface-${{ runner.os }}-v1
+          restore-keys: |
+            huggingface-${{ runner.os }}-
+
+      - name: Ensure Hugging Face cache directories exist
+        run: |
+          mkdir -p "$HF_HUB_CACHE"
+
+      - name: Show Hugging Face cache status
+        run: |
+          echo "hf-cache-hit=${{ steps.hf-cache.outputs.cache-hit }}"
+          echo "HF_HOME=$HF_HOME"
+          find "$HF_HOME" -maxdepth 3 -type d || true
+          du -sh "$HF_HOME" || true
+          du -sh "$HF_HUB_CACHE" || true
+
       - name: Sync dependencies with uv
-        run: uv sync
+        run: uv sync --extra quantum
+
+      - name: Verify Hugging Face authentication
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::error::HF_TOKEN is not set. Unauthenticated requests hit stricter rate limits and will time out. Add the HF_TOKEN repository secret."
+            exit 1
+          fi
+          uv run python -c "from huggingface_hub import whoami; print('Authenticated as:', whoami()['name'])"
 
       - name: Run tests
         run: uv run pytest --cov=DeepSDFStruct --cov-report=term-missing --cov-report=xml tests
 
+      - name: Show Hugging Face cache after tests
+        if: always()
+        run: |
+          echo "Post-test Hugging Face cache usage"
+          du -sh "$HF_HOME" || true
+          du -sh "$HF_HUB_CACHE" || true
+
       - name: Coveralls
-        if: matrix.python-version == '3.13'
+        if: matrix.python-version == '3.13' && matrix.os == 'ubuntu-latest'
         uses: coverallsapp/github-action@v2
