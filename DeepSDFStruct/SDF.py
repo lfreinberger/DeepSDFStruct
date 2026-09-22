@@ -726,7 +726,12 @@ class SDFfromDeepSDF(SDFBase):
         queries = queries.to(self.get_device())
         n_queries = queries.shape[0]
 
-        sdf_values = torch.zeros(n_queries, device=self.get_device())
+        # dtype from the queries, not the global default: the rest of this class is
+        # dtype-agnostic (see get_dtype), and a hard-coded float32 buffer here silently
+        # downcast the whole SDF evaluation even when the decoder ran in float64.
+        sdf_values = torch.zeros(
+            n_queries, device=self.get_device(), dtype=queries.dtype
+        )
 
         head = 0
         if self.latvec is None:
