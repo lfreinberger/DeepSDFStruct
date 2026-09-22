@@ -551,9 +551,15 @@ class MMA:
                 g = np.asarray(g, dtype=float).reshape(-1)
                 J = np.asarray(J, dtype=float).reshape(g.size, -1)
                 if g.size != _restore_scale.size:
+                    if geom_rows is None and np.all(_restore_scale == 1.0):
+                        # Without geom_rows the callback may return any subset of
+                        # the constraint rows; with no row scaled there is nothing
+                        # to rescale, so pass the rows through as they are.
+                        return g, J
                     raise ValueError(
                         f"restore_eval returned {g.size} rows, expected "
-                        f"{_restore_scale.size} (geom_rows)"
+                        f"{_restore_scale.size}; pass geom_rows to say which "
+                        "constraint rows (and hence which G_scale entries) they are"
                     )
                 return g / _restore_scale, J / _restore_scale[:, None]
 
