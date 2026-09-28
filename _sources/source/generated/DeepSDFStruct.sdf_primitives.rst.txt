@@ -1,0 +1,39 @@
+DeepSDFStruct.sdf\_primitives
+=============================
+
+.. automodule:: DeepSDFStruct.sdf_primitives
+
+   
+   .. rubric:: Classes
+
+   .. autosummary::
+   
+      BoxSDF
+      CappedConeSDF
+      CapsuleSDF
+      CircleSDF
+      ConeSDF
+      CornerSpheresSDF
+      CrossMsSDF
+      CylinderSDF
+      DodecahedronSDF
+      EllipsoidSDF
+      EquilateralTriangleSDF
+      HexagonSDF
+      IcosahedronSDF
+      LineSDF
+      OctahedronSDF
+      PlaneSDF
+      PolygonSDF
+      PyramidSDF
+      RectangleSDF
+      RoundedBoxSDF
+      RoundedConeSDF
+      RoundedCylinderSDF
+      RoundedRectangleSDF
+      SlabSDF
+      SphereSDF
+      TetrahedronSDF
+      TorusSDF
+      WireframeBoxSDF
+   

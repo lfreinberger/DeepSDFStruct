@@ -1,0 +1,19 @@
+DeepSDFStruct.design\_of\_experiments
+=====================================
+
+.. automodule:: DeepSDFStruct.design_of_experiments
+
+   
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      create_experiment
+      run_experiment
+   
+   .. rubric:: Classes
+
+   .. autosummary::
+   
+      ExperimentSpecifications
+   

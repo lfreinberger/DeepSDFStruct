@@ -1,0 +1,41 @@
+DeepSDFStruct.SDF
+=================
+
+.. automodule:: DeepSDFStruct.SDF
+
+   
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      generate_plane_points
+      get_equidistant_grid_sample
+      normalize_mesh_to_unit_cube
+      point_segment_distance
+      project_bounds
+      union_numpy
+      union_torch
+   
+   .. rubric:: Classes
+
+   .. autosummary::
+   
+      BoxSDF
+      CapBorderDict
+      CapType
+      CappedBorderSDF
+      DifferenceSDF
+      ExtrudeSDF
+      NegatedCallable
+      SDF2D
+      SDFBase
+      SDFfromDeepSDF
+      SDFfromLineMesh
+      SDFfromMesh
+      SmoothDifferenceSDF
+      SmoothIntersectionSDF
+      SmoothUnionSDF
+      SummedSDF
+      TransformedSDF
+      UnionSDF
+   

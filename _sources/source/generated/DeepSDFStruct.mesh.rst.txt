@@ -1,0 +1,34 @@
+DeepSDFStruct.mesh
+==================
+
+.. automodule:: DeepSDFStruct.mesh
+
+   
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      create_2D_mesh
+      create_3D_mesh
+      export_abaqus_surf_mesh
+      export_reconstructed_artifacts
+      export_sdf_grid_vtk
+      export_surface_mesh
+      export_volume_mesh
+      find_lattice_sdf
+      generate_2D_surf_mesh
+      get_verts
+      mergeMeshs
+      process_N_base_input
+      prune_collinear
+      sdf_to_triangle_dict
+      tetrahedralize_surface
+   
+   .. rubric:: Classes
+
+   .. autosummary::
+   
+      torchLineMesh
+      torchSurfMesh
+      torchVolumeMesh
+   

@@ -1,0 +1,13 @@
+DeepSDFStruct.utils
+===================
+
+.. automodule:: DeepSDFStruct.utils
+
+   
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      configure_logging
+      with_float32_lattice
+   
