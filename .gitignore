@@ -146,6 +146,7 @@ slurm-*.out
 
 # intermediate model runs
 mlruns
+mlruns.db
 mlflow.db
 run_train_mlflow_single_run.py
 run_train_mlflow.py
