@@ -185,13 +185,19 @@ class LatentFieldModel:
                     cp.clamp_(-float(self.code_bound), float(self.code_bound))
         return cp.detach().clone()
 
-    def velocity_residual(self, control_points, fit, evaluate, cp_dot=None, iters=200):
+    def velocity_residual(
+        self, control_points, fit, evaluate, cp_dot=None, iters=400, ridge=1e-3
+    ):
         """Relative residual ``|J c_dot - v| / |v|`` on the ``evaluate`` points.
 
         ``fit`` and ``evaluate`` are ``(xyz, v)`` pairs (``v`` = ``dsdf/dt``).
-        Without ``cp_dot`` the least-squares velocity is fitted on ``fit``
-        (L-BFGS from zero); with it, ``fit`` is unused. Returns
-        ``(residual, cp_dot)``.
+        Without ``cp_dot`` the velocity is fitted on ``fit`` by ridge least
+        squares (L-BFGS from zero; ``ridge`` weighs the mean square of
+        ``c_dot`` against the relative squared residual). There are more
+        control-point velocities than a few ten thousand points can pin down,
+        so without the ridge and enough points the fit interpolates the fit
+        points and generalizes badly. With ``cp_dot`` given, ``fit`` is unused.
+        Returns ``(residual on evaluate, residual on fit or nan, cp_dot)``.
         """
         xyz_e, v_e = evaluate
         _, g_e = self.latent_gradient(control_points, xyz_e)
@@ -217,18 +223,22 @@ class LatentFieldModel:
             def closure():
                 opt.zero_grad(set_to_none=True)
                 r = (g_f * dot_field(xyz_f)).sum(-1) - v_f
-                loss = r.pow(2).mean() / scale
+                loss = r.pow(2).mean() / scale + ridge * dot_cp.pow(2).mean()
                 loss.backward()
                 return loss
 
             opt.step(closure)
+            with torch.no_grad():
+                r_f = (g_f * dot_field(xyz_f)).sum(-1) - v_f
+                rel_fit = float((r_f.norm() / v_f.norm().clamp_min(1e-12)).item())
         else:
             dot_field.set_param(cp_dot)
+            rel_fit = float("nan")
 
         with torch.no_grad():
             r = (g_e * dot_field(xyz_e)).sum(-1) - v_e
             rel = r.norm() / v_e.norm().clamp_min(1e-12)
-        return float(rel.item()), dot_cp.detach().clone()
+        return float(rel.item()), rel_fit, dot_cp.detach().clone()
 
 
 def load_frame_samples(filename, n, seed=0, geom_dimension=3):
@@ -268,9 +278,11 @@ def evaluate_trajectories(
     reconstruct_lr: float = 5e-3,
     velocity: bool = True,
     velocity_band: float = 0.01,
-    velocity_points: int = 20000,
+    velocity_fit_points: int = 60000,
+    velocity_eval_points: int = 20000,
     seed: int = 0,
     model: LatentFieldModel | None = None,
+    control_points: dict | None = None,
 ) -> dict:
     """The trajectory tests of the module docstring on ``split`` (default: the
     experiment's ``TrainSplit``, which uses the trained control points).
@@ -278,8 +290,9 @@ def evaluate_trajectories(
     ``reconstruct`` fits every frame with the frozen decoder on ``n_fit``
     samples; metrics are always measured on ``n_samples`` other samples
     (``None``: all remaining). Velocity residuals need the ``dsdf/dt`` column
-    and use up to ``velocity_points`` fit / evaluation points within
-    ``|sdf| < velocity_band``.
+    use up to ``velocity_fit_points`` / ``velocity_eval_points`` disjoint
+    points within ``|sdf| < velocity_band``. ``control_points`` (as returned
+    before) skips the reconstruction and reuses them.
 
     Returns ``{"frames": [...], "mean": {...}, "control_points": {...}}``;
     ``control_points`` maps ``(trajectory, frame)`` to the frame's control
@@ -297,6 +310,7 @@ def evaluate_trajectories(
         raise ValueError(f"the split {split} holds no trajectory frames")
     trained = None if reconstruct else m.trained_fields(len(npyfiles))
 
+    given = control_points
     records, control_points = [], {}
     for traj, frames in sorted(trajectories.items()):
         if len(frames) < 3:
@@ -305,12 +319,15 @@ def evaluate_trajectories(
         for position, (sid, t) in enumerate(frames):
             filename = os.path.join(data_source, ws.sdf_samples_subdir, npyfiles[sid])
             n_eval = n_samples or 0
-            rows = load_frame_samples(
-                filename, n_fit + n_eval if n_samples else 10**12, seed + sid, dim
-            ).to(m.device)
+            # the same rows as for the reconstruction, so evaluation rows stay
+            # unseen; the velocity band is taken from all of them
+            n_load = n_fit + n_eval if n_samples else 10**12
+            rows = load_frame_samples(filename, n_load, seed + sid, dim).to(m.device)
             fit_rows = rows[: min(n_fit, len(rows) // 2)] if reconstruct else rows[:0]
             eval_rows = rows[len(fit_rows) :][: n_samples or None]
-            if reconstruct:
+            if given is not None:
+                cp = given[(traj, position)].to(m.device)
+            elif reconstruct:
                 cp = m.reconstruct(
                     fit_rows[:, :dim],
                     fit_rows[:, dim : dim + 1],
@@ -326,12 +343,13 @@ def evaluate_trajectories(
             evals.append(eval_rows)
             if velocity and rows.shape[1] > dim + 1:
                 band = rows[rows[:, dim].abs() < velocity_band]
-                half = min(velocity_points, len(band) // 2)
-            if velocity and rows.shape[1] > dim + 1 and half >= 8:
+                n_e = min(velocity_eval_points, len(band) // 2)
+                n_f = min(velocity_fit_points, len(band) - n_e)
+            if velocity and rows.shape[1] > dim + 1 and n_e >= 8:
                 vel_sets.append(
                     (
-                        (band[:half, :dim], band[:half, dim + 1]),
-                        (band[half : 2 * half, :dim], band[half : 2 * half, dim + 1]),
+                        (band[:n_f, :dim], band[:n_f, dim + 1]),
+                        (band[-n_e:, :dim], band[-n_e:, dim + 1]),
                     )
                 )
             else:
@@ -362,12 +380,12 @@ def evaluate_trajectories(
             }
             if vel_sets[position] is not None:
                 fit_set, eval_set = vel_sets[position]
-                record["vel_ls_rel"], _ = m.velocity_residual(
+                record["vel_ls_rel"], record["vel_ls_fit_rel"], _ = m.velocity_residual(
                     cps[position], fit_set, eval_set
                 )
                 dt = frames[position + 1][1] - frames[position - 1][1]
                 cp_dot = (cps[position + 1] - cps[position - 1]) / dt
-                record["vel_fd_rel"], _ = m.velocity_residual(
+                record["vel_fd_rel"], _, _ = m.velocity_residual(
                     cps[position], None, eval_set, cp_dot=cp_dot
                 )
             records.append(record)

@@ -410,9 +410,12 @@ def test_velocity_residual_is_zero_for_an_expressible_motion(tmp_path, trajector
     with torch.no_grad():
         v = (g * field(xyz)).sum(-1)
 
-    exact, _ = m.velocity_residual(cp, None, (xyz, v), cp_dot=cp_dot)
+    exact, _, _ = m.velocity_residual(cp, None, (xyz, v), cp_dot=cp_dot)
     assert exact == pytest.approx(0.0, abs=1e-5)
-    fitted, _ = m.velocity_residual(cp, (xyz[:200], v[:200]), (xyz[:200], v[:200]))
+    fitted, fit_rel, _ = m.velocity_residual(
+        cp, (xyz[:200], v[:200]), (xyz[:200], v[:200]), ridge=0.0
+    )
+    assert fitted == pytest.approx(fit_rel)
     assert fitted < 0.05
 
 
