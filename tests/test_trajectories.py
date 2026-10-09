@@ -35,7 +35,11 @@ from DeepSDFStruct.deep_sdf.training_latent_field import (
     train,
     trajectory_smoothness,
 )
-from DeepSDFStruct.deep_sdf.trajectory_eval import evaluate_trajectory_interpolation
+from DeepSDFStruct.deep_sdf.trajectory_eval import (
+    LatentFieldModel,
+    evaluate_trajectories,
+    evaluate_trajectory_interpolation,
+)
 
 UNIT_BOUNDS = np.array([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]])
 SPECS_SOURCE = pathlib.Path(
@@ -355,6 +359,7 @@ def test_training_with_trajectory_terms(tmp_path, trajectory_data):
         trajectory_data,
         TrajectorySmoothnessLambda=1.0,
         TrajectoryVelocityLambda=0.1,
+        TrajectoryVelocityPoints=8,
     )
     summary = train(experiment, data_source=str(trajectory_data), device="cpu")
     assert np.isfinite(summary["loss"])
@@ -366,6 +371,49 @@ def test_training_with_trajectory_terms(tmp_path, trajectory_data):
     assert [(r["trajectory"], r["frame"]) for r in result["frames"]] == [(0, 1), (1, 1)]
     for value in result["mean"].values():
         assert np.isfinite(value)
+
+
+def test_heldout_evaluation_reconstructs_every_frame(tmp_path, trajectory_data):
+    experiment = _experiment(tmp_path, trajectory_data)
+    train(experiment, data_source=str(trajectory_data), device="cpu")
+
+    result = evaluate_trajectories(
+        experiment,
+        split="splits/train.json",
+        reconstruct=True,
+        data_source=str(trajectory_data),
+        device="cpu",
+        n_samples=256,
+        n_fit=512,
+        reconstruct_iters=5,
+        velocity_band=0.1,
+    )
+    assert len(result["control_points"]) == 6  # 2 trajectories x 3 frames
+    for key in ("fit_l1", "interp_l1", "vel_ls_rel", "vel_fd_rel"):
+        assert np.isfinite(result["mean"][key]), key
+    assert 0.0 <= result["mean"]["vel_ls_rel"] <= 1.0 + 1e-6
+
+
+def test_velocity_residual_is_zero_for_an_expressible_motion(tmp_path, trajectory_data):
+    """A target velocity made from the Jacobian itself is fitted exactly."""
+    experiment = _experiment(tmp_path, trajectory_data)
+    train(experiment, data_source=str(trajectory_data), device="cpu")
+    m = LatentFieldModel(experiment, device="cpu")
+
+    torch.manual_seed(0)
+    cp = torch.randn_like(m.fields(1)[0].torch_spline.control_points) * 0.1
+    cp_dot = torch.randn_like(cp)
+    xyz = torch.rand(400, 3) * 1.8 - 0.9
+    _, g = m.latent_gradient(cp, xyz)
+    field = m.fields(1)[0]
+    field.set_param(cp_dot)
+    with torch.no_grad():
+        v = (g * field(xyz)).sum(-1)
+
+    exact, _ = m.velocity_residual(cp, None, (xyz, v), cp_dot=cp_dot)
+    assert exact == pytest.approx(0.0, abs=1e-5)
+    fitted, _ = m.velocity_residual(cp, (xyz[:200], v[:200]), (xyz[:200], v[:200]))
+    assert fitted < 0.05
 
 
 def test_trajectory_data_trains_without_the_terms(tmp_path, trajectory_data):

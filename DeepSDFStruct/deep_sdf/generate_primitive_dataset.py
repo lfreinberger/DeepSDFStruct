@@ -381,6 +381,29 @@ def _filter_to_bounds(sampled: SampledSDF, bounds: np.ndarray) -> SampledSDF:
     )
 
 
+def scene_parameters(cfg: dict, idx: int) -> tuple[list[dict], list[dict] | None]:
+    """Primitive parameters and motions (``None`` for a static dataset) of
+    scene / trajectory ``idx`` exactly as ``generate_primitive_dataset`` draws
+    them for ``cfg``. Rebuild frame ``t`` with
+    ``_build_scene_from_params(_scene_params_at(params, motions, t))``, e.g.
+    for the analytic ground truth of a trajectory dataset.
+    """
+    _make_primitive.scale_range = tuple(cfg["scale_range"])
+    bounds = np.asarray(cfg["bounds"], dtype=np.float64)
+    rng = np.random.default_rng(int(cfg["seed"]) + idx)
+    params = _sample_scene_params(
+        primitive_types=list(cfg["primitive_types"]),
+        n_primitives=int(cfg["primitives_per_scene"]),
+        bounds=bounds,
+        random_rotation=bool(cfg["random_rotation"]),
+        rng=rng,
+    )
+    motions = None
+    if int(cfg.get("frames_per_trajectory", 1)) > 1:
+        motions = _sample_motion(params, dict(cfg.get("motion", {})), bounds, rng)
+    return params, motions
+
+
 def generate_primitive_dataset(cfg: dict) -> dict:
     """Generate a primitive-scene SDF dataset according to ``cfg``.
 
@@ -433,20 +456,9 @@ def generate_primitive_dataset(cfg: dict) -> dict:
 
         # deterministic, per-scene seeding (covers numpy + torch + trimesh.sample)
         scene_seed = int(cfg["seed"]) + idx
-        rng = np.random.default_rng(scene_seed)
         np.random.seed(scene_seed % (2**32 - 1))
         torch.manual_seed(scene_seed)
-
-        params = _sample_scene_params(
-            primitive_types=list(cfg["primitive_types"]),
-            n_primitives=int(cfg["primitives_per_scene"]),
-            bounds=bounds,
-            random_rotation=bool(cfg["random_rotation"]),
-            rng=rng,
-        )
-        motions = None
-        if n_frames > 1:
-            motions = _sample_motion(params, motion, bounds, rng)
+        params, motions = scene_parameters(cfg, idx)
 
         for k, (name, npz_path) in enumerate(zip(frame_names, npz_paths)):
             t = k / (n_frames - 1) if n_frames > 1 else 0.0

@@ -622,6 +622,11 @@ def train(
     trajectory_velocity_lambda = float(
         get_spec_with_default(specs, "TrajectoryVelocityLambda", 0.0)
     )
+    # near-surface points per scene and batch for the velocity term (None: all);
+    # the term costs a second forward/backward with create_graph per point
+    trajectory_velocity_points = get_spec_with_default(
+        specs, "TrajectoryVelocityPoints", None
+    )
 
     loss_type = get_spec_with_default(specs, "LossType", "ClampedL1")
     if loss_type.lower() == "clampedl1":
@@ -965,7 +970,13 @@ def train(
                         if not mask.any():
                             continue
                         traj, position = scene_to_frame[sid_int]
-                        xyz_v = xyz_i[mask]
+                        sel = mask.nonzero(as_tuple=True)[0]
+                        if trajectory_velocity_points is not None and sel.numel() > int(
+                            trajectory_velocity_points
+                        ):
+                            perm = torch.randperm(sel.numel(), device=sel.device)
+                            sel = sel[perm[: int(trajectory_velocity_points)]]
+                        xyz_v = xyz_i[sel]
                         z = latent_fields[sid_int](xyz_v)
                         z_dot = latent_time_derivative(
                             latent_fields, trajectories[traj], position, xyz_v
@@ -973,7 +984,7 @@ def train(
                         dfdt = decoded_time_derivative(
                             probe_struct, probe_latents, z, z_dot, xyz_v
                         )
-                        vel_residuals.append((dfdt - dsdf_dt_chunks[i][mask]).abs())
+                        vel_residuals.append((dfdt - dsdf_dt_chunks[i][sel]).abs())
                     if vel_residuals:
                         vel_loss = torch.cat(vel_residuals).mean()
                         loss_total = loss_total + trajectory_velocity_lambda * vel_loss
