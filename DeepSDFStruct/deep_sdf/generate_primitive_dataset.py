@@ -370,6 +370,56 @@ def _sdf_time_derivative(
         return (sdf_plus(points) - sdf_minus(points)) / (2.0 * dt)
 
 
+def _sample_union_surface(
+    scene_sdf: SDFBase,
+    scene_mesh: trimesh.Trimesh,
+    n_samples: int,
+    stds: list[float],
+    buried_tol: float = 0.02,
+    projection_steps: int = 3,
+    max_rounds: int = 50,
+) -> SampledSDF:
+    """Near-surface samples around the *visible* surface of the union.
+
+    ``scene_mesh`` concatenates every primitive's surface, so with overlapping
+    primitives a large share of it lies buried inside other primitives;
+    ``sample_mesh_surface`` then puts "near-surface" samples deep inside the
+    solid. Here surface points with ``sdf < -buried_tol`` are rejected
+    (``buried_tol`` exceeds the facet error of the curved primitives' meshes),
+    the rest is projected onto the analytic zero level set by Newton steps
+    ``p <- p - sdf(p) n(p)`` and perturbed along ``n = grad sdf / |grad sdf|``.
+    Every std gets its own ``n_samples`` surface points.
+    """
+    samples = []
+    for std in stds:
+        kept, count = [], 0
+        for _ in range(max_rounds):
+            pts, _ = trimesh.sample.sample_surface(scene_mesh, 2 * n_samples)
+            p = torch.tensor(pts, dtype=torch.float32)
+            with torch.no_grad():
+                p = p[scene_sdf(p).reshape(-1) > -buried_tol]
+            kept.append(p)
+            count += len(p)
+            if count >= n_samples:
+                break
+        p = torch.cat(kept)[:n_samples]
+        with torch.enable_grad():
+            for _ in range(projection_steps + 1):
+                p = p.detach().requires_grad_(True)
+                d = scene_sdf(p).reshape(-1, 1)
+                g = torch.autograd.grad(d.sum(), p)[0]
+                normal = g / g.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                if _ < projection_steps:
+                    p = p - d * normal
+        p, normal = p.detach(), normal.detach()
+        t = torch.randn(len(p), 1) * std
+        samples.append(p + t * normal)
+    queries = torch.vstack(samples)
+    with torch.no_grad():
+        distances = scene_sdf(queries)
+    return SampledSDF(samples=queries, distances=distances)
+
+
 def _filter_to_bounds(sampled: SampledSDF, bounds: np.ndarray) -> SampledSDF:
     """Drop any sample whose coordinates fall outside ``bounds`` (e.g. when
     near-surface Gaussian perturbations push points beyond the box)."""
@@ -475,12 +525,20 @@ def generate_primitive_dataset(cfg: dict) -> dict:
                     n_samples=int(cfg["n_uniform"]),
                     sampling_strategy="uniform",
                 )
-                surface = sample_mesh_surface(
-                    scene_sdf,
-                    scene_mesh,
-                    int(cfg["n_surface_per_std"]),
-                    list(cfg["stds"]),
-                )
+                if cfg.get("surface_sampling", "mesh") == "union":
+                    surface = _sample_union_surface(
+                        scene_sdf,
+                        scene_mesh,
+                        int(cfg["n_surface_per_std"]),
+                        list(cfg["stds"]),
+                    )
+                else:
+                    surface = sample_mesh_surface(
+                        scene_sdf,
+                        scene_mesh,
+                        int(cfg["n_surface_per_std"]),
+                        list(cfg["stds"]),
+                    )
                 combined = uniform + surface
                 # near-surface Gaussian perturbations can push points past the
                 # box; reject anything outside the bounds so no sample lies outside.
@@ -526,6 +584,7 @@ def generate_primitive_dataset(cfg: dict) -> dict:
         "stds": list(cfg["stds"]),
         "scale_range": list(cfg["scale_range"]),
         "random_rotation": bool(cfg["random_rotation"]),
+        "surface_sampling": cfg.get("surface_sampling", "mesh"),
         "frames_per_trajectory": n_frames,
         "motion": motion,
         "dsdf_dt_step": dsdf_dt_step,
@@ -555,6 +614,10 @@ CONFIG = {
     "stds": [0.005, 0.0001],  # paper sigma1, sigma2
     "scale_range": [0.1, 0.5],  # characteristic half-size of primitives
     "random_rotation": True,
+    # "mesh": perturb points of every primitive's surface (incl. surfaces buried in
+    # other primitives); "union": only the visible surface of the union, projected
+    # onto the analytic zero level set (_sample_union_surface)
+    "surface_sampling": "mesh",
     # > 1: every scene is a trajectory of this many frames (see module docstring)
     "frames_per_trajectory": 1,
     "motion": {

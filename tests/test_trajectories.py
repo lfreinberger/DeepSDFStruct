@@ -23,6 +23,7 @@ from DeepSDFStruct.deep_sdf.generate_primitive_dataset import (
     _build_scene_from_params,
     _make_primitive,
     _sample_motion,
+    _sample_union_surface,
     _sample_scene_params,
     _scene_params_at,
     _sdf_time_derivative,
@@ -441,3 +442,38 @@ def test_trajectory_terms_need_a_trajectory_dataset(tmp_path):
     experiment = _experiment(tmp_path, root, TrajectorySmoothnessLambda=1.0)
     with pytest.raises(ValueError, match="need a trajectory dataset"):
         train(experiment, data_source=str(root), device="cpu")
+
+
+def test_union_surface_sampling_avoids_buried_surfaces(scale_range):
+    """Two overlapping boxes: mesh sampling puts samples deep inside, union not."""
+    params = [
+        {"type": "box", "scale_vec": np.full(3, 0.4), "R": np.eye(3), "center": c}
+        for c in (np.array([-0.15, 0.0, 0.0]), np.array([0.15, 0.0, 0.0]))
+    ]
+    sdf, mesh = _build_scene_from_params(params)
+    np.random.seed(0)
+    torch.manual_seed(0)
+    union = _sample_union_surface(sdf, mesh, 2000, [0.0])
+    assert union.distances.abs().max().item() < 1e-5  # std 0: on the surface
+
+    from DeepSDFStruct.sampling import sample_mesh_surface
+
+    plain = sample_mesh_surface(sdf, mesh, 2000, [0.0])
+    assert (plain.distances < -0.05).float().mean().item() > 0.1
+
+
+def test_union_surface_sampling_projects_curved_primitives():
+    """Facets of the sphere mesh lie inside the sphere; samples end up on it."""
+    params = [
+        {
+            "type": "sphere",
+            "scale_vec": np.full(3, 0.5),
+            "R": np.eye(3),
+            "center": np.zeros(3),
+        }
+    ]
+    sdf, mesh = _build_scene_from_params(params)
+    out = _sample_union_surface(sdf, mesh, 1000, [0.0])
+    torch.testing.assert_close(
+        out.samples.norm(dim=-1), torch.full((1000,), 0.5), atol=1e-5, rtol=0
+    )
