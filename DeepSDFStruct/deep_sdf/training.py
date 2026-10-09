@@ -563,7 +563,7 @@ def train_deep_sdf(
 
         for sdf_data, properties, indices in sdf_loader:
             # Process the input data
-            sdf_data = sdf_data.reshape(-1, geom_dimension + 1).to(device)
+            sdf_data = sdf_data.reshape(-1, sdf_data.shape[-1]).to(device)
             properties_expanded = properties.reshape(-1, properties.shape[-1]).to(
                 device
             )

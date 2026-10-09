@@ -13,11 +13,27 @@ For each scene the SDF is sampled in two complementary ways:
   - near the surface via Gaussian perturbations at several standard deviations
     (``sample_mesh_surface``).
 
+Trajectories
+------------
+With ``frames_per_trajectory > 1`` every scene becomes a *trajectory*: the
+primitives move (translate, rotate about their centre, rescale) linearly in a
+pseudo-time ``t in [0, 1]`` and the scene is sampled at ``K`` equally spaced
+frames. Each frame is written as its own instance, so the existing loaders and
+trainers see an ordinary dataset; the frame's ``trajectory_id``, ``frame_index``
+and ``t`` are stored in the npz so a trainer can group the frames again (see
+``read_trajectory_info`` in ``data.py``). Every sample row gets a fifth column,
+the time derivative ``dsdf/dt`` of the ground-truth SDF at that point, by a
+central finite difference in ``t``. By the level-set equation
+``dsdf/dt = -V_n |grad sdf|``, i.e. it encodes the normal velocity of the
+boundary -- the quantity a shape sensitivity is made of. Frame 0 of a
+trajectory is the static scene the same seed produces with
+``frames_per_trajectory = 1``.
+
 The output is written in the layout consumed by ``SDFSamples`` in
 ``training_latent_field.py``::
 
     <data_source>/
-    ├── SdfSamples/<dataset_name>/<class_name>/<instance>.npz   # pos/neg, [x,y,z,sdf]
+    ├── SdfSamples/<dataset_name>/<class_name>/<instance>.npz   # pos/neg, [x,y,z,sdf(,dsdf_dt)]
     ├── SdfSamples/<dataset_name>/<vtp_subdir>/<instance>.vtp   # ParaView point clouds
     └── splits/<split_name>.json                                # {dataset:{class:[instance,...]}}
 
@@ -94,6 +110,8 @@ def _place(
         scaleFactor=1.0,
     )
 
+    if canonical_mesh is None:
+        return sdf, None
     T = np.eye(4)
     T[:3, :3] = R
     T[:3, 3] = center
@@ -141,16 +159,30 @@ def _make_primitive(
     """
     s_lo, s_hi = _make_primitive.scale_range
     scale_vec = rng.uniform(s_lo, s_hi, size=3)  # independent x/y/z semi-sizes
+    sdf, mesh = _primitive_sdf_and_mesh(prim_type, scale_vec)
+    return sdf, mesh, scale_vec
 
+
+def _primitive_sdf_and_mesh(
+    prim_type: str, scale_vec: np.ndarray, with_mesh: bool = True
+) -> tuple[SDFBase, trimesh.Trimesh | None]:
+    """Canonical (unplaced) primitive SDF and matching mesh for ``scale_vec``.
+
+    ``with_mesh=False`` skips the mesh (returns ``None``) when only the SDF is
+    needed, e.g. for the finite-difference time derivative.
+    """
+    mesh = None
     if prim_type == "sphere":
         unit_sdf = SphereSDF(center=[0.0, 0.0, 0.0], radius=1.0)
         sdf = _AnisoScaledSDF(unit_sdf, scale_vec)
-        mesh = trimesh.creation.icosphere(subdivisions=2, radius=1.0)
-        mesh.apply_scale(scale_vec.tolist())  # -> ellipsoid with semi-axes scale_vec
+        if with_mesh:
+            mesh = trimesh.creation.icosphere(subdivisions=2, radius=1.0)
+            mesh.apply_scale(scale_vec.tolist())  # -> ellipsoid, semi-axes scale_vec
     elif prim_type == "box":
         extents = (2.0 * scale_vec).tolist()  # exact anisotropic box
         sdf = BoxSDF(center=[0.0, 0.0, 0.0], extents=extents)
-        mesh = trimesh.creation.box(extents=extents)
+        if with_mesh:
+            mesh = trimesh.creation.box(extents=extents)
     elif prim_type == "cylinder":
         # unit cylinder: radius 1 (x/y), height 2 (half-height 1 along z), which
         # matches trimesh.creation.cylinder(radius=1, height=2) below.
@@ -158,30 +190,31 @@ def _make_primitive(
             point_a=[0.0, 0.0, -1.0], point_b=[0.0, 0.0, 1.0], radius=1.0
         )
         sdf = _AnisoScaledSDF(unit_sdf, scale_vec)
-        mesh = trimesh.creation.cylinder(radius=1.0, height=2.0, sections=32)
-        mesh.apply_scale(scale_vec.tolist())  # elliptical cross-section + scaled height
+        if with_mesh:
+            mesh = trimesh.creation.cylinder(radius=1.0, height=2.0, sections=32)
+            mesh.apply_scale(scale_vec.tolist())  # elliptical section + scaled height
     else:
         raise ValueError(f"Unknown primitive type: {prim_type}")
 
-    return sdf, mesh, scale_vec
+    return sdf, mesh
 
 
-def _build_scene(
+def _sample_scene_params(
     primitive_types: list[str],
     n_primitives: int,
     bounds: np.ndarray,
     random_rotation: bool,
     rng: np.random.Generator,
-) -> tuple[SDFBase, trimesh.Trimesh]:
-    """Compose a scene SDF (union of placed primitives) and the concatenated
-    surface mesh used for near-surface sampling."""
+) -> list[dict]:
+    """Draw the parameters of a scene: per primitive its type, per-axis
+    semi-sizes ``scale_vec``, rotation ``R`` and ``center``."""
     bounds_lo, bounds_hi = bounds[0], bounds[1]
-    sdfs: list[SDFBase] = []
-    meshes: list[trimesh.Trimesh] = []
+    s_lo, s_hi = _make_primitive.scale_range
+    params: list[dict] = []
 
     for _ in range(n_primitives):
         prim_type = str(rng.choice(primitive_types))
-        canonical_sdf, canonical_mesh, scale_vec = _make_primitive(prim_type, rng)
+        scale_vec = rng.uniform(s_lo, s_hi, size=3)  # independent x/y/z semi-sizes
 
         # keep the primitive (roughly) inside the box; out-of-bounds samples are
         # rejected later regardless, this just avoids wasting samples.
@@ -191,7 +224,25 @@ def _build_scene(
         center = rng.uniform(lo, hi)
 
         R = _random_rotation_matrix(rng) if random_rotation else np.eye(3)
-        sdf, mesh = _place(canonical_sdf, canonical_mesh, R, center)
+        params.append(
+            {"type": prim_type, "scale_vec": scale_vec, "R": R, "center": center}
+        )
+    return params
+
+
+def _build_scene_from_params(
+    params: list[dict], with_mesh: bool = True
+) -> tuple[SDFBase, trimesh.Trimesh | None]:
+    """Compose a scene SDF (union of placed primitives) and the concatenated
+    surface mesh used for near-surface sampling (``None`` if ``with_mesh`` is
+    off)."""
+    sdfs: list[SDFBase] = []
+    meshes: list[trimesh.Trimesh] = []
+    for p in params:
+        canonical_sdf, canonical_mesh = _primitive_sdf_and_mesh(
+            p["type"], p["scale_vec"], with_mesh=with_mesh
+        )
+        sdf, mesh = _place(canonical_sdf, canonical_mesh, p["R"], p["center"])
         sdfs.append(sdf)
         meshes.append(mesh)
 
@@ -199,8 +250,124 @@ def _build_scene(
     for s in sdfs[1:]:
         scene_sdf = scene_sdf + s  # UnionSDF via torch.minimum
 
-    scene_mesh = trimesh.util.concatenate(meshes)
+    scene_mesh = trimesh.util.concatenate(meshes) if with_mesh else None
     return scene_sdf, scene_mesh
+
+
+def _build_scene(
+    primitive_types: list[str],
+    n_primitives: int,
+    bounds: np.ndarray,
+    random_rotation: bool,
+    rng: np.random.Generator,
+) -> tuple[SDFBase, trimesh.Trimesh]:
+    """Compose a random scene SDF (union of placed primitives) and the
+    concatenated surface mesh used for near-surface sampling."""
+    params = _sample_scene_params(
+        primitive_types, n_primitives, bounds, random_rotation, rng
+    )
+    return _build_scene_from_params(params)
+
+
+def _axis_angle_matrix(axis: np.ndarray, angle: float) -> np.ndarray:
+    """Rotation matrix about the unit vector ``axis`` by ``angle`` (Rodrigues)."""
+    x, y, z = axis
+    K = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
+    return np.eye(3) + np.sin(angle) * K + (1.0 - np.cos(angle)) * (K @ K)
+
+
+def _random_unit_vector(rng: np.random.Generator) -> np.ndarray:
+    v = rng.normal(size=3)
+    return v / np.linalg.norm(v)
+
+
+def _sample_motion(
+    params: list[dict], motion: dict, bounds: np.ndarray, rng: np.random.Generator
+) -> list[dict]:
+    """Draw a linear motion over ``t in [0, 1]`` for every primitive.
+
+    A primitive moves with probability ``motion["moving_fraction"]``; a moving
+    one translates by up to ``max_translation`` (random direction), rotates
+    about its centre by up to ``max_rotation_deg`` (random axis) and rescales
+    each semi-axis by a factor in ``exp(+-max_log_scale)``. The end centre is
+    kept inside the box with the larger of the start / end margins, and the
+    end scale inside ``scale_range``.
+    """
+    s_lo, s_hi = _make_primitive.scale_range
+    max_translation = float(motion.get("max_translation", 0.0))
+    max_rotation = np.deg2rad(float(motion.get("max_rotation_deg", 0.0)))
+    max_log_scale = float(motion.get("max_log_scale", 0.0))
+    moving_fraction = float(motion.get("moving_fraction", 1.0))
+
+    motions: list[dict] = []
+    for p in params:
+        static = {
+            "translation": np.zeros(3),
+            "axis": np.array([0.0, 0.0, 1.0]),
+            "angle": 0.0,
+            "log_scale": np.zeros(3),
+        }
+        if rng.random() >= moving_fraction:
+            motions.append(static)
+            continue
+
+        translation = _random_unit_vector(rng) * rng.uniform(0.0, max_translation)
+        axis = _random_unit_vector(rng)
+        angle = rng.uniform(-max_rotation, max_rotation)
+        log_scale = rng.uniform(-max_log_scale, max_log_scale, size=3)
+
+        scale_end = np.clip(p["scale_vec"] * np.exp(log_scale), s_lo, s_hi)
+        log_scale = np.log(scale_end / p["scale_vec"])
+
+        margin = float(max(np.max(p["scale_vec"]), np.max(scale_end)))
+        lo = np.minimum(bounds[0] + margin, bounds[1] - margin)
+        hi = np.maximum(bounds[0] + margin, bounds[1] - margin)
+        translation = np.clip(p["center"] + translation, lo, hi) - p["center"]
+
+        motions.append(
+            {
+                "translation": translation,
+                "axis": axis,
+                "angle": angle,
+                "log_scale": log_scale,
+            }
+        )
+    return motions
+
+
+def _scene_params_at(params: list[dict], motions: list[dict], t: float) -> list[dict]:
+    """Scene parameters at pseudo-time ``t`` (linear in translation, rotation
+    angle and log-scale; ``t`` outside ``[0, 1]`` extrapolates)."""
+    out = []
+    for p, m in zip(params, motions):
+        out.append(
+            {
+                "type": p["type"],
+                "scale_vec": p["scale_vec"] * np.exp(t * m["log_scale"]),
+                "R": _axis_angle_matrix(m["axis"], t * m["angle"]) @ p["R"],
+                "center": p["center"] + t * m["translation"],
+            }
+        )
+    return out
+
+
+def _sdf_time_derivative(
+    params: list[dict], motions: list[dict], t: float, points: torch.Tensor, dt: float
+) -> torch.Tensor:
+    """``d sdf / dt`` at ``points`` by a central finite difference in ``t``.
+
+    Exact up to O(dt^2) where the scene SDF is smooth in ``t``; at the medial
+    sets of the union (``torch.minimum``) and inside non-exact anisotropic
+    fields it is the one-sided mix the min selects.
+    """
+    sdf_plus, _ = _build_scene_from_params(
+        _scene_params_at(params, motions, t + dt), with_mesh=False
+    )
+    sdf_minus, _ = _build_scene_from_params(
+        _scene_params_at(params, motions, t - dt), with_mesh=False
+    )
+    with torch.no_grad():
+        return (sdf_plus(points) - sdf_minus(points)) / (2.0 * dt)
 
 
 def _filter_to_bounds(sampled: SampledSDF, bounds: np.ndarray) -> SampledSDF:
@@ -243,16 +410,25 @@ def generate_primitive_dataset(cfg: dict) -> dict:
         vtp_dir.mkdir(parents=True, exist_ok=True)
     split_path.parent.mkdir(parents=True, exist_ok=True)
 
+    n_frames = int(cfg.get("frames_per_trajectory", 1))
+    if n_frames < 1:
+        raise ValueError(f"frames_per_trajectory must be >= 1, got {n_frames}")
+    motion = dict(cfg.get("motion", {}))
+    dsdf_dt_step = float(cfg.get("dsdf_dt_step", 1e-3))
+
     instance_names: list[str] = []
     n_scenes = int(cfg["num_scenes"])
     for i in range(n_scenes):
         idx = int(cfg["instance_start_index"]) + i
-        instance_name = f"{dataset_name}_{idx}"
-        instance_names.append(instance_name)
+        if n_frames == 1:
+            frame_names = [f"{dataset_name}_{idx}"]
+        else:
+            frame_names = [f"{dataset_name}_{idx}_f{k:03d}" for k in range(n_frames)]
+        instance_names.extend(frame_names)
 
-        npz_path = sample_dir / f"{instance_name}.npz"
-        if npz_path.is_file() and not cfg["overwrite"]:
-            logger.info(f"[skip] {npz_path} (exists)")
+        npz_paths = [sample_dir / f"{name}.npz" for name in frame_names]
+        if all(path.is_file() for path in npz_paths) and not cfg["overwrite"]:
+            logger.info(f"[skip] {npz_paths[0]} ... ({len(npz_paths)} exist)")
             continue
 
         # deterministic, per-scene seeding (covers numpy + torch + trimesh.sample)
@@ -261,43 +437,64 @@ def generate_primitive_dataset(cfg: dict) -> dict:
         np.random.seed(scene_seed % (2**32 - 1))
         torch.manual_seed(scene_seed)
 
-        with torch.no_grad():
-            scene_sdf, scene_mesh = _build_scene(
-                primitive_types=list(cfg["primitive_types"]),
-                n_primitives=int(cfg["primitives_per_scene"]),
-                bounds=bounds,
-                random_rotation=bool(cfg["random_rotation"]),
-                rng=rng,
-            )
-
-            uniform = random_sample_sdf(
-                scene_sdf,
-                bounds=bounds.tolist(),
-                n_samples=int(cfg["n_uniform"]),
-                sampling_strategy="uniform",
-            )
-            surface = sample_mesh_surface(
-                scene_sdf, scene_mesh, int(cfg["n_surface_per_std"]), list(cfg["stds"])
-            )
-            combined = uniform + surface
-            # near-surface Gaussian perturbations can push points past the box;
-            # reject anything outside the bounds so no sample lies outside.
-            combined = _filter_to_bounds(combined, bounds)
-
-        pos, neg = combined.split_pos_neg()
-        np.savez(
-            npz_path,
-            neg=neg.stacked.detach().cpu().numpy(),
-            pos=pos.stacked.detach().cpu().numpy(),
+        params = _sample_scene_params(
+            primitive_types=list(cfg["primitive_types"]),
+            n_primitives=int(cfg["primitives_per_scene"]),
+            bounds=bounds,
+            random_rotation=bool(cfg["random_rotation"]),
+            rng=rng,
         )
+        motions = None
+        if n_frames > 1:
+            motions = _sample_motion(params, motion, bounds, rng)
 
-        if cfg["save_vtp"]:
-            save_points_to_vtp(vtp_dir / f"{instance_name}.vtp", combined.stacked)
+        for k, (name, npz_path) in enumerate(zip(frame_names, npz_paths)):
+            t = k / (n_frames - 1) if n_frames > 1 else 0.0
+            frame_params = (
+                params if motions is None else _scene_params_at(params, motions, t)
+            )
 
-        logger.info(
-            f"[{i + 1}/{n_scenes}] {instance_name}: "
-            f"{pos.samples.shape[0]} pos / {neg.samples.shape[0]} neg -> {npz_path}"
-        )
+            with torch.no_grad():
+                scene_sdf, scene_mesh = _build_scene_from_params(frame_params)
+
+                uniform = random_sample_sdf(
+                    scene_sdf,
+                    bounds=bounds.tolist(),
+                    n_samples=int(cfg["n_uniform"]),
+                    sampling_strategy="uniform",
+                )
+                surface = sample_mesh_surface(
+                    scene_sdf,
+                    scene_mesh,
+                    int(cfg["n_surface_per_std"]),
+                    list(cfg["stds"]),
+                )
+                combined = uniform + surface
+                # near-surface Gaussian perturbations can push points past the
+                # box; reject anything outside the bounds so no sample lies outside.
+                combined = _filter_to_bounds(combined, bounds)
+
+                rows = combined.stacked
+                if motions is not None:
+                    dsdf_dt = _sdf_time_derivative(
+                        params, motions, t, combined.samples, dsdf_dt_step
+                    )
+                    rows = torch.hstack((rows, dsdf_dt.reshape(-1, 1)))
+
+            rows = rows.detach().cpu().numpy()
+            is_pos = rows[:, 3] >= 0.0
+            extra = {}
+            if motions is not None:
+                extra = {"trajectory_id": idx, "frame_index": k, "t": t}
+            np.savez(npz_path, neg=rows[~is_pos], pos=rows[is_pos], **extra)
+
+            if cfg["save_vtp"]:
+                save_points_to_vtp(vtp_dir / f"{name}.vtp", combined.stacked)
+
+            logger.info(
+                f"[{i + 1}/{n_scenes}] {name}: "
+                f"{int(is_pos.sum())} pos / {int((~is_pos).sum())} neg -> {npz_path}"
+            )
 
     # split json: {dataset: {class: [instance, ...]}}
     split = {dataset_name: {class_name: instance_names}}
@@ -317,6 +514,9 @@ def generate_primitive_dataset(cfg: dict) -> dict:
         "stds": list(cfg["stds"]),
         "scale_range": list(cfg["scale_range"]),
         "random_rotation": bool(cfg["random_rotation"]),
+        "frames_per_trajectory": n_frames,
+        "motion": motion,
+        "dsdf_dt_step": dsdf_dt_step,
         "seed": int(cfg["seed"]),
         "date_created": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "sdf_struct_version": version("DeepSDFStruct"),
@@ -343,6 +543,15 @@ CONFIG = {
     "stds": [0.005, 0.0001],  # paper sigma1, sigma2
     "scale_range": [0.1, 0.5],  # characteristic half-size of primitives
     "random_rotation": True,
+    # > 1: every scene is a trajectory of this many frames (see module docstring)
+    "frames_per_trajectory": 1,
+    "motion": {
+        "max_translation": 0.3,  # per primitive, over t in [0, 1]
+        "max_rotation_deg": 30.0,  # about the primitive's centre
+        "max_log_scale": 0.3,  # per-axis scale factor in exp(+-0.3)
+        "moving_fraction": 0.5,  # share of primitives that move
+    },
+    "dsdf_dt_step": 1e-3,  # finite-difference step in t for dsdf/dt
     "seed": 42,
     "save_vtp": True,  # ParaView point clouds
     "vtp_subdir": "paraview",

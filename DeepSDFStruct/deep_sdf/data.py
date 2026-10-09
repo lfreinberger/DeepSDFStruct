@@ -117,6 +117,31 @@ def _read_pos_neg(npz):
     return npz[pos_key], npz[neg_key]
 
 
+def read_trajectory_info(data_source, npyfiles):
+    """Group the instances of a split into trajectories.
+
+    Trajectory datasets (``generate_primitive_dataset`` with
+    ``frames_per_trajectory > 1``) store ``trajectory_id``, ``frame_index``
+    and ``t`` in every npz. Returns ``{trajectory_id: [(scene_index, t), ...]}``
+    with each list sorted by frame, where ``scene_index`` is the position in
+    ``npyfiles`` (the dataset index). Instances without the keys are skipped,
+    so a plain dataset returns ``{}``.
+    """
+    frames = {}
+    for scene_index, f in enumerate(npyfiles):
+        npz = np.load(os.path.join(data_source, ws.sdf_samples_subdir, f))
+        if "trajectory_id" not in npz:
+            continue
+        traj = int(npz["trajectory_id"])
+        frames.setdefault(traj, []).append(
+            (int(npz["frame_index"]), scene_index, float(npz["t"]))
+        )
+    return {
+        traj: [(scene_index, t) for _, scene_index, t in sorted(entries)]
+        for traj, entries in frames.items()
+    }
+
+
 def read_sdf_samples_into_ram(filename):
     npz = np.load(filename)
     pos, neg = _read_pos_neg(npz)

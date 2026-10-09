@@ -115,6 +115,75 @@ def _seed_worker(worker_id):
     random.seed(worker_seed)
 
 
+class _FixedLatents(torch.nn.Module):
+    """Parametrization that hands the lattice a precomputed latent per query.
+
+    Lets ``LatticeSDFStruct`` decode latents that are not a spline evaluation,
+    e.g. ``z + s * z_dot`` for the time-derivative term. ``z`` must have one
+    row per query the struct passes in (all queries inside its bounds).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.z = None
+
+    def forward(self, queries):
+        if self.z is None or self.z.shape[0] != queries.shape[0]:
+            raise RuntimeError("_FixedLatents: latents do not match the queries")
+        return self.z
+
+
+def _control_points(latent_field):
+    return latent_field.torch_spline.control_points
+
+
+def trajectory_smoothness(latent_fields, trajectories):
+    """Mean squared second difference of the control points along each
+    trajectory (frames assumed equally spaced in ``t``).
+
+    Zero when the latent field moves on a straight line at constant speed
+    between the frames, i.e. when linear interpolation of the control points
+    reproduces the intermediate frames. Trajectories with fewer than three
+    frames contribute nothing.
+    """
+    terms = []
+    for frames in trajectories:
+        if len(frames) < 3:
+            continue
+        cps = torch.stack([_control_points(latent_fields[sid]) for sid, _ in frames])
+        terms.append((cps[2:] - 2.0 * cps[1:-1] + cps[:-2]).pow(2).mean())
+    if not terms:
+        return None
+    return torch.stack(terms).mean()
+
+
+def latent_time_derivative(latent_fields, frames, position, queries):
+    """``dz/dt`` of the latent field at ``queries`` for frame ``position`` of a
+    trajectory: central difference of the neighbouring frames' latent fields
+    (one-sided at the ends). ``frames`` is ``[(scene_index, t), ...]``."""
+    a = max(position - 1, 0)
+    b = min(position + 1, len(frames) - 1)
+    (sid_a, t_a), (sid_b, t_b) = frames[a], frames[b]
+    return (latent_fields[sid_b](queries) - latent_fields[sid_a](queries)) / (t_b - t_a)
+
+
+def decoded_time_derivative(probe, probe_latents, z, z_dot, queries):
+    """``d f(x, z(x, t)) / dt = (df/dz) . z_dot`` per query point.
+
+    The directional derivative is taken with respect to a per-point scalar
+    ``s`` in ``f(x, z + s z_dot)`` at ``s = 0``: the decoder is pointwise, so
+    the gradient of the summed output gives each point's own derivative. The
+    graph is kept so the result can be trained.
+    """
+    s = torch.zeros(queries.shape[0], device=queries.device, requires_grad=True)
+    probe_latents.z = z + s.unsqueeze(-1) * z_dot
+    try:
+        pred = probe(queries)
+    finally:
+        probe_latents.z = None
+    return torch.autograd.grad(pred.sum(), s, create_graph=True)[0]
+
+
 def _make_lr_schedule(sched_spec):
     if isinstance(sched_spec, (int, float)):
         return ConstantLearningRateSchedule(sched_spec)
@@ -385,6 +454,12 @@ def train(
             "CodeRegularizationLambda", specs.get("CodeRegularizationLambda", None)
         )
         mlflow.log_param("CodeBound", specs.get("CodeBound", None))
+        mlflow.log_param(
+            "TrajectorySmoothnessLambda", specs.get("TrajectorySmoothnessLambda", 0.0)
+        )
+        mlflow.log_param(
+            "TrajectoryVelocityLambda", specs.get("TrajectoryVelocityLambda", 0.0)
+        )
 
         mlflow.log_param("Tiling", json.dumps(specs.get("Tiling", None)))
         mlflow.log_param(
@@ -536,6 +611,18 @@ def train(
 
     eikonal_lambda = float(get_spec_with_default(specs, "EikonalLambda", 0.0))
 
+    # Trajectory datasets (generate_primitive_dataset, frames_per_trajectory > 1):
+    #   TrajectorySmoothnessLambda: second difference of the control points
+    #     along each trajectory -> linear latent interpolation follows the motion
+    #   TrajectoryVelocityLambda: (df/dz) . dz/dt against the sampled dsdf/dt
+    #     near the surface -> the latent Jacobian reproduces boundary velocities
+    trajectory_smoothness_lambda = float(
+        get_spec_with_default(specs, "TrajectorySmoothnessLambda", 0.0)
+    )
+    trajectory_velocity_lambda = float(
+        get_spec_with_default(specs, "TrajectoryVelocityLambda", 0.0)
+    )
+
     loss_type = get_spec_with_default(specs, "LossType", "ClampedL1")
     if loss_type.lower() == "clampedl1":
         loss_fn = ClampedL1Loss(clamp_val=clamp_dist)
@@ -559,6 +646,28 @@ def train(
     )
     num_scenes = len(sdf_dataset)
     logging.info(f"There are {num_scenes} scenes")
+
+    use_trajectories = (
+        trajectory_smoothness_lambda > 0 or trajectory_velocity_lambda > 0
+    )
+    trajectories = {}
+    scene_to_frame = {}  # scene index -> (trajectory id, position in trajectory)
+    if use_trajectories:
+        trajectories = DeepSDFStruct.deep_sdf.data.read_trajectory_info(
+            data_source, sdf_dataset.npyfiles
+        )
+        if not trajectories:
+            raise ValueError(
+                "TrajectorySmoothnessLambda / TrajectoryVelocityLambda need a "
+                "trajectory dataset (npz files with trajectory_id / frame_index / t)"
+            )
+        for traj, frames in trajectories.items():
+            for position, (sid, _) in enumerate(frames):
+                scene_to_frame[sid] = (traj, position)
+        logging.info(
+            f"{len(trajectories)} trajectories, "
+            f"{len(scene_to_frame)}/{num_scenes} scenes are trajectory frames"
+        )
 
     num_data_loader_threads = int(get_spec_with_default(specs, "DataLoaderThreads", 1))
     loader_generator = torch.Generator()
@@ -599,6 +708,15 @@ def train(
             bounds=bounds_param_space,
         )
         structs.append(struct)
+
+    # decodes latents that are not a spline evaluation (velocity term)
+    probe_latents = _FixedLatents()
+    probe_struct = LatticeSDFStruct(
+        tiling=tiling,
+        microtile=SDFfromDeepSDF(deep_sdf_model),
+        parametrization=probe_latents,
+        bounds=bounds_param_space,
+    )
 
     lr_schedules_spec = get_spec_with_default(
         specs,
@@ -719,16 +837,27 @@ def train(
 
         epoch_loss = 0.0
         epoch_reg = 0.0
+        epoch_traj_smooth = 0.0
+        epoch_traj_vel = 0.0
         n_batches = 0
         epoch_error = 0.0
 
         for sdf_data, properties, indices in sdf_loader:
-            # sdf_data: (ScenesPerBatch, SamplesPerScene, geom_dim+1)
-            sdf_data = sdf_data.reshape(-1, geom_dimension + 1).to(device)
+            # sdf_data: (ScenesPerBatch, SamplesPerScene, geom_dim+1), plus a
+            # dsdf/dt column in trajectory datasets
+            sdf_data = sdf_data.reshape(-1, sdf_data.shape[-1]).to(device)
             indices = indices.to(device)  # (ScenesPerBatch,)
 
             xyz = sdf_data[:, 0:geom_dimension]
             sdf_gt = sdf_data[:, geom_dimension].unsqueeze(1)
+            if trajectory_velocity_lambda > 0:
+                if sdf_data.shape[1] < geom_dimension + 2:
+                    raise ValueError(
+                        "TrajectoryVelocityLambda needs the dsdf/dt sample column"
+                    )
+                dsdf_dt_chunks = torch.chunk(
+                    sdf_data[:, geom_dimension + 1], batch_split
+                )
 
             if enforce_minmax:
                 sdf_gt = torch.clamp(sdf_gt, minT, maxT)
@@ -745,6 +874,8 @@ def train(
 
             batch_loss = 0.0
             batch_reg = 0.0
+            batch_traj_smooth = 0.0
+            batch_traj_vel = 0.0
 
             for i in range(batch_split):
                 xyz_i = xyz_chunks[i]
@@ -817,6 +948,37 @@ def train(
                         eikonal_loss = torch.cat(eik_sq_residuals).mean()
                         loss_total = loss_total + eikonal_lambda * eikonal_loss
 
+                # Trajectory velocity: the decoded SDF must change in time like
+                # the ground truth, d f(x, z(x,t))/dt = dsdf/dt, near the surface
+                if trajectory_velocity_lambda > 0:
+                    inside = (
+                        (xyz_i >= bounds_param_space[0])
+                        & (xyz_i <= bounds_param_space[1])
+                    ).all(dim=-1)
+                    near = (sdf_i.abs().squeeze(-1) < clamp_dist) & inside
+                    vel_residuals = []
+                    for sid in idx_i.unique():
+                        sid_int = int(sid.item())
+                        if sid_int not in scene_to_frame:
+                            continue
+                        mask = mask_cache[sid_int] & near
+                        if not mask.any():
+                            continue
+                        traj, position = scene_to_frame[sid_int]
+                        xyz_v = xyz_i[mask]
+                        z = latent_fields[sid_int](xyz_v)
+                        z_dot = latent_time_derivative(
+                            latent_fields, trajectories[traj], position, xyz_v
+                        )
+                        dfdt = decoded_time_derivative(
+                            probe_struct, probe_latents, z, z_dot, xyz_v
+                        )
+                        vel_residuals.append((dfdt - dsdf_dt_chunks[i][mask]).abs())
+                    if vel_residuals:
+                        vel_loss = torch.cat(vel_residuals).mean()
+                        loss_total = loss_total + trajectory_velocity_lambda * vel_loss
+                        batch_traj_vel += float(vel_loss.detach().item()) / batch_split
+
                 # Normalize by batch_split so the accumulated gradient (and the
                 # logged loss) equal the full-batch mean regardless of BatchSplit.
                 loss_total = loss_total / batch_split
@@ -824,6 +986,21 @@ def train(
 
                 batch_loss += float(loss.detach().item()) / batch_split
                 batch_reg += float(reg.detach().item()) / batch_split
+
+            # Trajectory smoothness on the control points of every trajectory
+            # this batch touches (all its frames, so the whole path is shaped)
+            if trajectory_smoothness_lambda > 0:
+                touched = {
+                    scene_to_frame[int(sid)][0]
+                    for sid in indices.unique().tolist()
+                    if int(sid) in scene_to_frame
+                }
+                smooth = trajectory_smoothness(
+                    latent_fields, [trajectories[traj] for traj in sorted(touched)]
+                )
+                if smooth is not None:
+                    (trajectory_smoothness_lambda * smooth).backward()
+                    batch_traj_smooth = float(smooth.detach().item())
 
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(decoder.parameters(), grad_clip)
@@ -840,20 +1017,34 @@ def train(
             epoch_error += batch_loss
             if use_mlflow and (global_step % mlflow_log_every_n_batches == 0):
                 # log batch-level metrics
-                mlflow.log_metrics(
-                    {"batch_loss": float(batch_loss), "batch_reg": float(batch_reg)},
-                    step=global_step,
-                )
+                batch_metrics = {
+                    "batch_loss": float(batch_loss),
+                    "batch_reg": float(batch_reg),
+                }
+                if trajectory_smoothness_lambda > 0:
+                    batch_metrics["batch_traj_smooth"] = batch_traj_smooth
+                if trajectory_velocity_lambda > 0:
+                    batch_metrics["batch_traj_vel"] = batch_traj_vel
+                mlflow.log_metrics(batch_metrics, step=global_step)
             global_step += 1
 
             loss_log.append(float(batch_loss))
 
             epoch_loss += batch_loss
             epoch_reg += batch_reg
+            epoch_traj_smooth += batch_traj_smooth
+            epoch_traj_vel += batch_traj_vel
             n_batches += 1
 
         avg_loss = epoch_loss / max(1, n_batches)
         avg_reg = epoch_reg / max(1, n_batches)
+        avg_traj_smooth = epoch_traj_smooth / max(1, n_batches)
+        avg_traj_vel = epoch_traj_vel / max(1, n_batches)
+        traj_string = ""
+        if trajectory_smoothness_lambda > 0:
+            traj_string += f"Traj. smooth: {avg_traj_smooth:.3e} "
+        if trajectory_velocity_lambda > 0:
+            traj_string += f"Traj. vel.: {avg_traj_vel:.4f} "
 
         error = epoch_error / len(sdf_loader)
         tot_time = time.time() - start_train
@@ -870,6 +1061,7 @@ def train(
             logging.info(
                 f"Finished epoch {epoch:5g}/{num_epochs} | "
                 f"with Reg.: {avg_reg:.4f} "
+                f"{traj_string}"
                 f"and Tot.: {avg_loss:.4f} "
                 f"[{epoch/num_epochs*100:.2f}%] in {time_string} "
                 f"({avg_time_per_epoch:.2f}s/epoch)"
@@ -893,6 +1085,10 @@ def train(
                 "lr_decoder": float(optimizer_all.param_groups[0]["lr"]),
                 "lr_latent_fields": float(optimizer_all.param_groups[1]["lr"]),
             }
+            if trajectory_smoothness_lambda > 0:
+                epoch_metrics["epoch_traj_smooth"] = float(avg_traj_smooth)
+            if trajectory_velocity_lambda > 0:
+                epoch_metrics["epoch_traj_vel"] = float(avg_traj_vel)
             mlflow.log_metrics(epoch_metrics, step=int(epoch))
 
         if epoch in checkpoints:
