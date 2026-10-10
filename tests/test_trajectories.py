@@ -477,3 +477,26 @@ def test_union_surface_sampling_projects_curved_primitives():
     torch.testing.assert_close(
         out.samples.norm(dim=-1), torch.full((1000,), 0.5), atol=1e-5, rtol=0
     )
+
+
+def test_static_scenes_mixed_into_a_trajectory_split(tmp_path, trajectory_data):
+    """Scenes without the dsdf/dt column skip the velocity term instead of failing."""
+    samples_dir = trajectory_data / ws.sdf_samples_subdir / "synthetic" / "spheres"
+    rows = np.random.default_rng(1).uniform(-1, 1, (2000, 4)).astype(np.float32)
+    rows[:, 3] = np.linalg.norm(rows[:, :3], axis=1) - 0.55
+    np.savez(
+        samples_dir / "static0.npz", pos=rows[rows[:, 3] > 0], neg=rows[rows[:, 3] <= 0]
+    )
+    split = json.loads((trajectory_data / "splits" / "train.json").read_text())
+    split["synthetic"]["spheres"] = split["synthetic"]["spheres"] + ["static0"]
+    (trajectory_data / "splits" / "mixed.json").write_text(json.dumps(split))
+    experiment = _experiment(
+        tmp_path,
+        trajectory_data,
+        TrainSplit="splits/mixed.json",
+        ScenesPerBatch=1,
+        TrajectoryVelocityLambda=0.1,
+        TrajectoryVelocityPoints=8,
+    )
+    summary = train(experiment, data_source=str(trajectory_data), device="cpu")
+    assert np.isfinite(summary["loss"])

@@ -855,11 +855,14 @@ def train(
 
             xyz = sdf_data[:, 0:geom_dimension]
             sdf_gt = sdf_data[:, geom_dimension].unsqueeze(1)
-            if trajectory_velocity_lambda > 0:
-                if sdf_data.shape[1] < geom_dimension + 2:
-                    raise ValueError(
-                        "TrajectoryVelocityLambda needs the dsdf/dt sample column"
-                    )
+            # scenes without the dsdf/dt column (static datasets mixed into a
+            # trajectory split) skip the velocity term; mixing column counts
+            # within one batch needs ScenesPerBatch = 1
+            dsdf_dt_chunks = None
+            if (
+                trajectory_velocity_lambda > 0
+                and sdf_data.shape[1] >= geom_dimension + 2
+            ):
                 dsdf_dt_chunks = torch.chunk(
                     sdf_data[:, geom_dimension + 1], batch_split
                 )
@@ -955,7 +958,7 @@ def train(
 
                 # Trajectory velocity: the decoded SDF must change in time like
                 # the ground truth, d f(x, z(x,t))/dt = dsdf/dt, near the surface
-                if trajectory_velocity_lambda > 0:
+                if trajectory_velocity_lambda > 0 and dsdf_dt_chunks is not None:
                     inside = (
                         (xyz_i >= bounds_param_space[0])
                         & (xyz_i <= bounds_param_space[1])
