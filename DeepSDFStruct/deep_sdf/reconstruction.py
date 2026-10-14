@@ -76,6 +76,7 @@ def reconstruct_from_samples(
     eikonal_lambda: float = 0.0,
     step_callback=None,
     clamp_val: float = 0.1,
+    lr_final: float | None = None,
 ):
     if optimizer_name == "adam":
         optimizer = torch.optim.Adam(sdf.parameters(), lr=lr)
@@ -144,6 +145,12 @@ def reconstruct_from_samples(
         dataset, batch_size=batch_size, shuffle=True, drop_last=drop_last
     )
     n_batches = len(dataloader)
+    # Optional cosine decay of the Adam learning rate from lr to lr_final over all steps
+    scheduler = None
+    if lr_final is not None and optimizer_name == "adam":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(1, num_iterations * n_batches), eta_min=lr_final
+        )
 
     # Detect parametrization for regularization (e.g. LatticeSDFStruct)
     _parametrization = getattr(sdf, "parametrization", None)
@@ -188,6 +195,8 @@ def reconstruct_from_samples(
                     torch.nn.utils.clip_grad_norm_(sdf.parameters(), grad_clip)
 
                 optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
             elif optimizer_name == "lbfgs":
                 loss = optimizer.step(closure)
 

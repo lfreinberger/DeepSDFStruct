@@ -510,6 +510,7 @@ class LocalShapesReconstructor:
         step_callback: Callable[[int, int, int], None] | None = None,
         loss_fn: str = "ClampedL1",
         clamp_val: float = 0.1,
+        lr_final: float | None = None,
     ) -> dict[str, Any]:
         """Optimize *struct*'s latent codes against *samples*.
 
@@ -549,6 +550,9 @@ class LocalShapesReconstructor:
             If set, gradient-norm clipping threshold. ``None`` disables it.
         eikonal_lambda : float, default 0.0
             Weight of the near-surface Eikonal penalty ``(|grad SDF| - 1)^2``.
+        lr_final : float or None, default None
+            If set, the Adam learning rate decays from ``lr`` to ``lr_final``
+            along a cosine over all optimizer steps; ``None`` keeps it constant.
         loss_plot_path, loss_csv_path : path-like, optional
             Where to write the loss curve and its raw values.
         step_callback : callable, optional
@@ -579,6 +583,7 @@ class LocalShapesReconstructor:
             grad_clip=grad_clip,
             eikonal_lambda=eikonal_lambda,
             step_callback=step_callback,
+            lr_final=lr_final,
         )
 
     def fit_mesh(
